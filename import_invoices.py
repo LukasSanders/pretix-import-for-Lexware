@@ -1,3 +1,77 @@
+"""Import invoices from pretix to Lexware for a specified date.
+
+Summary
+-------
+Import all ticket sales from pretix and post them as vouchers to Lexware. The script imports invoices for 
+a specified date which can be passed as a command-line argument (default: yesterday). 
+In Lexware, a voucher (not an actual invoice) will be created using the collective contact. All lines of 
+the invoice will be passed as voucher items, so different tax rates will be handled correctly. 
+Cancellation invoices will also be imported as sales credit notes. 
+All vouchers will be creating using the same posting category which is specified as a constant in the script. 
+
+Setup & Use
+-----------
+The script relies on the following environment variables to be set:
+- PRETIX_RESOURCE_URL: The base URL of the pretix API (e.g https://pretix.pony-events.eu/api/v1/organizers/[org]/events/[event])
+- PRETIX_API_KEY: The API key for the pretix API.
+- LEXWARE_API_URL: The base URL of the Lexware API (e.g. https://api.lexware.io/v1).
+- LEXWARE_API_KEY: The API key for the Lexware API.
+
+The Lexware API URL remains static, the pretix API URL is event-specific and must be set accordingly. 
+You will need to run this script multiple times for each event if you want to handle multiple events.
+The API keys for both APIs must be generated in the respective systems. For more information on URLs and on how to 
+generate the API keys, please refer to the respective API documentation (see below).
+
+As the script imports invoices for a whole day, it should not be run for the current day. A failsafe for 
+duplicate imports is not yet implemented. 
+
+The script can be called with the following command line arguments:
+-d, --date DATE        Date for which to import invoices (format: YYYY-MM-DD).
+-t, --test             Run in test mode without actually creating invoices.
+-i, --inspect          Dump payload for Lexware API to the console for inspection. Only works in test mode.
+
+If the import is handled manually, pass the date (format: YYYY-MM-DD) for which to import invoices. The argument
+may be omitted if invoices for yesterday are to be imported. If the script is run automatically (e.g. via cron job),
+it is advisable to omit the date argument and run the script daily, as it will then always import invoices for the 
+previous day.
+
+For testing purposes, the script can be run in test mode, which will not create any vouchers in Lexware. Test mode
+can be activated passing the respective command line argument (-t, --test). If necessary, pass the argument -i, --inspect 
+to inspect the payload for the Lexware API. The payload that would have been sent to create
+the invoice will then be printed to the console. 
+In test mode, the script will still fetch and convert the invoices, just not call the Lexware API. 
+
+API Reference
+-------------
+For further information on the pretix and Lexware APIs, please refer to the following documentation:
+- https://developers.lexware.io/docs/
+- https://docs.pretix.eu/dev/api/index.html
+
+Copyright (c) 2026 Lukas Sanders.  All rights reserved.
+
+Developed by:   Lukas Sanders
+                https://github.com/LukasSanders
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that 
+the following conditions are met:
+
+1.  Redistributions of source code must retain the above copyright notice, this list of conditions and the following 
+    disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following 
+    disclaimer in the documentation and/or other materials provided with the distribution.
+3.  All advertising materials mentioning features or use of this software must display the following acknowledgement: 
+    This product includes software developed by Lukas Sanders.
+4.  Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products 
+    derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY LUKAS SANDERS AS IS AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, 
+THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL 
+LUKAS SANDERS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, 
+BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) 
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR 
+OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+"""
+
 import requests
 import json
 import os
@@ -7,6 +81,8 @@ import sys
 import time
 import argparse
 
+# Posting category ID for sales invoices in Lexware (sale of goods/services).
+# Adjust this id if necessary, list can be retrieved via the posting-categories endpoint of the Lexware API.
 PSTNG_CATEGORY_ID_SALES = '8f8664a8-fd86-11e1-a21f-0800200c9a66'
 
 logger = logging.getLogger(__name__)
@@ -21,8 +97,16 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 def main():
+    """Main function to handle the invoice import. 
 
-    parser = argparse.ArgumentParser(description='Import invoices from pretix to Lexware.')
+    Console arguments (via argparse):
+    -d, --date DATE        Date for which to import invoices (format: YYYY-MM-DD). Defaults to yesterday if not provided.
+    -t, --test             Run in test mode without actually creating invoices.
+    -i, --inspect          Dump payload for Lexware API to the console for inspection. Only works in test mode.
+    """
+
+    # Set up and retrieve command line arguments.
+    parser = argparse.ArgumentParser(description='Import invoices from pretix to Lexware for a specified date.')
     parser.add_argument('-d', '--date', 
                         type=lambda s: datetime.datetime.strptime(s, '%Y-%m-%d'), 
                         help='Date for which to import invoices (format: YYYY-MM-DD). Defaults to yesterday if not provided.')
@@ -37,12 +121,20 @@ def main():
     if test_mode:
         logger.warning('Running in test mode. No invoices will be created.')
 
+    # Get transactions for the specified date from pretix. The invoice endpoint has no date filter, 
+    # but a filter for order numbers. Therefore, we first fetch all transactions for the specified date, 
+    # filter out unique order numbers and then fetch all invoices for those orders. The list of invoices 
+    # is then filtered by the specified date to get only the relevant invoices created on that date.
+    logger.info(f'Fetching transactions for {import_date}...')
     transactions = get_transactions(import_date)
 
+    # If no transactions are found, leave the program.
     if len(transactions) == 0:
         logger.info(f'No transactions received for {import_date}. Leaving program.')
         return
 
+    # There can be more than one transaction per order on a single day, so we need to filter out duplicates.
+    # The unique list of orders is necessary to fetch the invoices for each order. 
     relevant_orders = set()
 
     for transaction in transactions:
@@ -61,6 +153,7 @@ def main():
             else: 
                 logger.info(f"Invoice {invoice['number']} for order {order} created on {invoice['date']}")
 
+    # Leave program if there are no invoices to import. 
     if len(invoices_to_import) == 0:
         logger.info(f'No invoices to import for {import_date}. Leaving program.')
         return
@@ -74,11 +167,16 @@ def main():
     for invoice in invoices_to_import:
         logger.info(f"Importing invoice {invoice['number']} for order {invoice['order']}...")
 
+        # The Lexware API has a rate limit of 2 requests per second. If the limit is exceeded, the API returns a 429 status code.
+        # We will retry the request in that case, up to a maximum number of attempts defined in the environment variable 
+        # LEXWARE_RETRY_COUNT, and wait 2 seconds.
         attempts = 0
         while (attempts <= int(os.environ.get('LEXWARE_RETRY_COUNT'))):  # type: ignore
 
             attempts += 1
 
+            # In test mode, the Lexware API will not be called and the payload will be logged to the console for inspection
+            # if requested. 
             if test_mode: 
                 logger.info(f"Invoice {invoice['number']} not imported (test mode).")
                 if test_inspect:
@@ -88,17 +186,17 @@ def main():
             result = create_voucher(convert_invoice(invoice))
 
             if result.ok: 
-                # Document has been created, exit loop
+                # Document has been created, exit loop.
                 logger.info(f"Invoice {invoice['number']} imported successfully.")
                 import_successful += 1
                 break
             elif result.status_code == 429:
                 # Rate limit exceeded, wait and try again 
-                time.sleep(3)
+                time.sleep(2)
                 logger.warning(f"API rate limit exceeded (status {result.status_code}). Will try again {int(os.environ.get('LEXWARE_RETRY_COUNT')) - attempts} more time(s).") # type: ignore
                 continue
             else: 
-                # Document creation failed for a different reason, exit loop 
+                # Document creation failed for a different reason, exit loop.
                 logger.error(f"Failed to import invoice {invoice['number']}: {result.status_code} {result.text}")
                 import_failed += 1
                 break
@@ -106,6 +204,11 @@ def main():
     logger.info(f'Import summary for {import_date}: {import_successful} successful, {import_failed} failed out of {total_invoices} total.')
 
 def get_transactions(date: datetime.date):
+    """Fetches transactions from the pretix API for a given date.
+
+    Keyword arguments:
+    date -- the date for which to fetch transactions
+    """
 
     url = os.environ.get('PRETIX_RESOURCE_URL') + '/transactions/?created_since=' + date.strftime('%Y-%m-%d') + 'T00:00:00Z' # type: ignore
     headers = {'Authorization': 'Token ' + os.environ.get('PRETIX_API_KEY')} # type: ignore
@@ -121,6 +224,11 @@ def get_transactions(date: datetime.date):
     return(json.loads(response.text)['results'])
 
 def get_invoices(order: str):
+    """Fetches invoices from the pretix API for a given order.
+
+    Keyword arguments:
+    order -- the order for which to fetch invoices
+    """
 
     url = os.environ.get('PRETIX_RESOURCE_URL') + '/invoices/?order=' + order # type: ignore
     headers = {'Authorization': 'Token ' + os.environ.get('PRETIX_API_KEY')} # type: ignore
@@ -130,6 +238,11 @@ def get_invoices(order: str):
     return(json.loads(response.text)['results'])
 
 def convert_invoice(invoice):
+    """Converts a pretix invoice to the format required by the Lexware API.
+
+    Keyword arguments:
+    invoice -- the pretix invoice to convert (JSON object), see API documentation for details on the JSON structure
+    """
 
     items = []
     total_gross = 0.0
@@ -165,6 +278,11 @@ def convert_invoice(invoice):
     })
 
 def create_voucher(voucher):
+    """Creates a voucher in the Lexware API.
+
+    Keyword arguments:
+    voucher -- the voucher data to create (JSON object), see Lexware API documentation for details on the JSON structure
+    """
 
     headers = {
         'Authorization': 'Bearer ' + os.environ.get('LEXWARE_API_KEY'),  # type: ignore
