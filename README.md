@@ -11,7 +11,7 @@ All vouchers will be creating using the same posting category which is specified
 
 ## Setup & Use
 The script relies on the following environment variables to be set:
-- PRETIX_RESOURCE_URL: The base URL of the pretix API (e.g https://pretix.pony-events.eu/api/v1/organizers/[org]/events/[event])
+- PRETIX_RESOURCE_URL: The base URL of the pretix API (e.g https://pretix.host.example/api/v1/organizers/[org]/events/[event])
 - PRETIX_API_KEY: The API key for the pretix API.
 - LEXWARE_API_URL: The base URL of the Lexware API (e.g. https://api.lexware.io/v1).
 - LEXWARE_API_KEY: The API key for the Lexware API.
