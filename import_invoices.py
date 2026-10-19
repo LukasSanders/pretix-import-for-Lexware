@@ -140,9 +140,12 @@ def main():
 
         LOGGER.addHandler(file_handler)
 
+    message = ''
+
     if TEST_MODE:
-        CONSOLE.print(Panel('Running in test mode. No invoices will be created.', title='TEST MODE', style='bold yellow'))
-        log('Running in test mode. No invoices will be created.', logging.WARNING)
+        message = 'Running in test mode. No invoices will be created.'
+        CONSOLE.print(Panel(message, title='TEST MODE', style='bold yellow'))
+        log(message, logging.WARNING)
 
     # Get transactions for the specified date from pretix. The invoice endpoint has no date filter, 
     # but a filter for order numbers. Therefore, we first fetch all transactions for the specified date, 
@@ -153,8 +156,9 @@ def main():
 
     # If no transactions are found, leave the program.
     if len(transactions) == 0:
-        CONSOLE.log(f'No transactions received for {IMPORT_DATE}. Leaving program.', style='bold yellow')
-        log(f'No transactions received for {IMPORT_DATE}. Leaving program.', logging.INFO)
+        message = f'No transactions received for {IMPORT_DATE}. Leaving program.'
+        CONSOLE.log(message, style='bold yellow')
+        log(message, logging.INFO)
         return
 
     # There can be more than one transaction per order on a single day, so we need to filter out duplicates.
@@ -167,8 +171,9 @@ def main():
     relevant_orders = list(relevant_orders_unique)
 
     with Progress() as prg_get_invoices:
-        task_get_invoice = prg_get_invoices.add_task(f'Fetching invoices for {len(relevant_orders)} orders...', total=len(relevant_orders))
-        log(f'Fetching invoices for {len(relevant_orders)} orders...', logging.INFO)
+        message = f'Fetching invoices for {len(relevant_orders)} orders...'
+        task_get_invoice = prg_get_invoices.add_task(message, total=len(relevant_orders))
+        log(message, logging.INFO)
         
         invoices_to_import = []
 
@@ -196,8 +201,9 @@ def main():
 
     # Leave program if there are no invoices to import. 
     if len(invoices_to_import) == 0:
-        CONSOLE.log(f'No invoices to import for {IMPORT_DATE}. Leaving program.', style='bold yellow')
-        log(f'No invoices to import for {IMPORT_DATE}. Leaving program.', logging.INFO)
+        message = f'No invoices to import for {IMPORT_DATE}. Leaving program.'
+        CONSOLE.log(message, style='bold yellow')
+        log(message, logging.INFO)
         return
 
     total_invoices = len(invoices_to_import)
@@ -211,8 +217,9 @@ def main():
     tbl_imp_invoices.add_column('Status', no_wrap=True)
 
     with Progress() as prg_post_invoices:
-        task_post_invoice = prg_post_invoices.add_task(f'Importing {total_invoices} invoices...', total=total_invoices)
-        log(f'Importing {total_invoices} invoices...', logging.INFO)
+        message = f'Importing {total_invoices} invoices...'
+        task_post_invoice = prg_post_invoices.add_task(message, total=total_invoices)
+        log(message, logging.INFO)
 
         while not prg_post_invoices.finished:
             invoice = invoices_to_import.pop(0)  # Get the next invoice to import
@@ -247,8 +254,9 @@ def main():
                 elif result.status_code == 429:
                     # Rate limit exceeded, wait and try again 
                     time.sleep(2)
-                    CONSOLE.log(f'API rate limit exceeded (status {result.status_code}). Will try again {int(os.environ.get("LEXWARE_RETRY_COUNT")) - attempts} more time(s).', style='bold yellow') # type: ignore
-                    log(f'API rate limit exceeded (status {result.status_code}). Will try again {int(os.environ.get("LEXWARE_RETRY_COUNT")) - attempts} more time(s).', logging.WARNING) # type: ignore
+                    message = f'API rate limit exceeded (status {result.status_code}). Will try again {int(os.environ.get("LEXWARE_RETRY_COUNT")) - attempts} more time(s).' # type: ignore
+                    CONSOLE.log(message, style='bold yellow') 
+                    log(message, logging.WARNING) 
                     continue
                 else: 
                     # Document creation failed for a different reason, exit loop.
