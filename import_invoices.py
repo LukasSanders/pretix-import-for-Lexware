@@ -12,10 +12,14 @@ All vouchers will be creating using the same posting category which is specified
 Setup & Use
 -----------
 The script relies on the following environment variables to be set:
-- PRETIX_RESOURCE_URL: The base URL of the pretix API (e.g https://pretix.pony-events.eu/api/v1/organizers/[org]/events/[event])
-- PRETIX_API_KEY: The API key for the pretix API.
-- LEXWARE_API_URL: The base URL of the Lexware API (e.g. https://api.lexware.io/v1).
-- LEXWARE_API_KEY: The API key for the Lexware API.
+-   PRETIX_RESOURCE_URL: The base URL of the pretix API (e.g https://pretix.pony-events.eu/api/v1/organizers/[org]/events/[event])
+-   PRETIX_API_KEY: The API key for the pretix API.
+-   LEXWARE_API_URL: The base URL of the Lexware API (e.g. https://api.lexware.io/v1).
+-   LEXWARE_API_KEY: The API key for the Lexware API.
+-   VOUCHER_TEXT: The voucher remark; elements of the invoice object (see pretix API) fields can be inserted
+    as placeholders, e.g. %order%.
+-   VOUCHER_ADDT_CANCELATION: Text added to cancellation vouchers; supports the same placeholders.
+-   VOUCHER_ADDT_REFERENCE: Text added to vouchers with a reference; supports the same placeholders.
 
 The Lexware API URL remains static, the pretix API URL is event-specific and must be set accordingly. 
 You will need to run this script multiple times for each event if you want to handle multiple events.
@@ -313,6 +317,17 @@ def get_invoices(order: str):
 
     return(json.loads(response.text)['results'])
 
+def replace_placeholders(text, invoice):
+    """Replace placeholders matching invoice keys, such as %order%, in text.
+    
+    Keyword arguments:
+    text    -- the text with placeholders from the .env file 
+    invoice -- the pretix invoice to convert (JSON object), see API documentation for details on the JSON structure    
+    """
+    for key, value in invoice.items():
+        text = text.replace(f'%{key}%', str(value))
+    return text
+
 def convert_invoice(invoice):
     """Converts a pretix invoice to the format required by the Lexware API.
 
@@ -339,8 +354,22 @@ def convert_invoice(invoice):
             'categoryId': PSTNG_CATEGORY_ID_SALES,
         })
 
-    cancellation_prefix = 'Storno ' if invoice['is_cancellation'] == True else ''
-    reference = f'\nReferenzbelegnummer: {invoice["refers"]}' if invoice['refers'] is not None else ''
+    voucher_text = replace_placeholders(
+        os.environ.get(
+            'VOUCHER_TEXT',
+            'Order %order% for event %event%,\n %invoice_to_name%, %invoice_to_street%, %invoice_to_zipcode% %invoice_to_city%, %invoice_to_country%',
+        ), invoice 
+        )
+
+    cancellation_prefix = (
+        replace_placeholders(os.environ.get('VOUCHER_ADDT_CANCELATION', 'Cancelation '), invoice)
+        if invoice['is_cancellation'] == True else ''
+    )
+
+    reference = (
+        replace_placeholders(os.environ.get( 'VOUCHER_ADDT_REFERENCE', '\Reference: %refers%'), invoice)
+        if invoice['refers'] is not None else ''
+    )
 
     return json.dumps({
         'type': 'salesinvoice' if invoice['is_cancellation'] == False else 'salescreditnote',
@@ -352,7 +381,7 @@ def convert_invoice(invoice):
         'totalTaxAmount': round(total_tax, 2),
         'taxType': 'gross',
         'useCollectiveContact': True,
-        'remark': f'{cancellation_prefix}Bestellung {invoice["order"]} zu Veranstaltung {invoice["event"]}\n{invoice["invoice_to_name"]}, {invoice["invoice_to_street"]}, {invoice["invoice_to_zipcode"]} {invoice["invoice_to_city"]}, {invoice["invoice_to_country"]}{reference}',
+        'remark': f'{cancellation_prefix}{voucher_text}{reference}',
         'voucherItems': items
     })
 
