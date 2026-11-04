@@ -367,7 +367,7 @@ def convert_invoice(invoice):
     )
 
     reference = (
-        replace_placeholders(os.environ.get( 'VOUCHER_ADDT_REFERENCE', '\Reference: %refers%'), invoice)
+        replace_placeholders(os.environ.get( 'VOUCHER_ADDT_REFERENCE', 'Reference: %refers%'), invoice)
         if invoice['refers'] is not None else ''
     )
 
