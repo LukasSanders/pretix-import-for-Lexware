@@ -12,10 +12,14 @@ All vouchers will be creating using the same posting category which is specified
 Setup & Use
 -----------
 The script relies on the following environment variables to be set:
-- PRETIX_RESOURCE_URL: The base URL of the pretix API (e.g https://pretix.pony-events.eu/api/v1/organizers/[org]/events/[event])
-- PRETIX_API_KEY: The API key for the pretix API.
-- LEXWARE_API_URL: The base URL of the Lexware API (e.g. https://api.lexware.io/v1).
-- LEXWARE_API_KEY: The API key for the Lexware API.
+-   PRETIX_RESOURCE_URL: The base URL of the pretix API (e.g https://pretix.pony-events.eu/api/v1/organizers/[org]/events/[event])
+-   PRETIX_API_KEY: The API key for the pretix API.
+-   LEXWARE_API_URL: The base URL of the Lexware API (e.g. https://api.lexware.io/v1).
+-   LEXWARE_API_KEY: The API key for the Lexware API.
+-   VOUCHER_TEXT: The voucher remark; elements of the invoice object (see pretix API) fields can be inserted
+    as placeholders, e.g. %order%.
+-   VOUCHER_ADDT_CANCELATION: Text added to cancellation vouchers; supports the same placeholders.
+-   VOUCHER_ADDT_REFERENCE: Text added to vouchers with a reference; supports the same placeholders.
 
 The Lexware API URL remains static, the pretix API URL is event-specific and must be set accordingly. 
 You will need to run this script multiple times for each event if you want to handle multiple events.
@@ -28,7 +32,7 @@ duplicate imports is not yet implemented.
 The script can be called with the following command line arguments:
 -d, --date DATE        Date for which to import invoices (format: YYYY-MM-DD).
 -t, --test             Run in test mode without actually creating invoices.
--i, --inspect          Dump payload for Lexware API to the console for inspection. Only works in test mode.
+-l, --logging          Create a log file in the same directory. 
 
 If the import is handled manually, pass the date (format: YYYY-MM-DD) for which to import invoices. The argument
 may be omitted if invoices for yesterday are to be imported. If the script is run automatically (e.g. via cron job),
@@ -36,9 +40,7 @@ it is advisable to omit the date argument and run the script daily, as it will t
 previous day.
 
 For testing purposes, the script can be run in test mode, which will not create any vouchers in Lexware. Test mode
-can be activated passing the respective command line argument (-t, --test). If necessary, pass the argument -i, --inspect 
-to inspect the payload for the Lexware API. The payload that would have been sent to create
-the invoice will then be printed to the console. 
+can be activated passing the respective command line argument (-t, --test). 
 In test mode, the script will still fetch and convert the invoices, just not call the Lexware API. 
 
 API Reference
@@ -76,25 +78,29 @@ import requests
 import json
 import os
 import datetime
-import logging
-import sys
 import time
 import argparse
+import logging
+from logging.handlers import RotatingFileHandler
+from dotenv import load_dotenv
+from rich.console import Console
+from rich.progress import Progress
+from rich.panel import Panel
+from rich.table import Table
+from rich.columns import Columns
 
 # Posting category ID for sales invoices in Lexware (sale of goods/services).
 # Adjust this id if necessary, list can be retrieved via the posting-categories endpoint of the Lexware API.
 PSTNG_CATEGORY_ID_SALES = '8f8664a8-fd86-11e1-a21f-0800200c9a66'
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+CONSOLE = Console()
+LOGGER = LOGGER = logging.getLogger(__name__)
+IMPORT_DATE = datetime.date.today() - datetime.timedelta(days=1)
+TEST_MODE = False
+LOGGING_ENABLED = False
+LOGFILE_NAME = 'pretix_to_lexware.log'
 
-handler = logging.StreamHandler(sys.stdout) 
-handler.setLevel(logging.INFO)
-
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
-
-logger.addHandler(handler)
+load_dotenv()
 
 def main():
     """Main function to handle the invoice import. 
@@ -102,7 +108,7 @@ def main():
     Console arguments (via argparse):
     -d, --date DATE        Date for which to import invoices (format: YYYY-MM-DD). Defaults to yesterday if not provided.
     -t, --test             Run in test mode without actually creating invoices.
-    -i, --inspect          Dump payload for Lexware API to the console for inspection. Only works in test mode.
+    -l, --logging          Create a log file in the same directory. 
     """
 
     # Set up and retrieve command line arguments.
@@ -111,97 +117,170 @@ def main():
                         type=lambda s: datetime.datetime.strptime(s, '%Y-%m-%d'), 
                         help='Date for which to import invoices (format: YYYY-MM-DD). Defaults to yesterday if not provided.')
     parser.add_argument('-t', '--test', action='store_true', help='Run in test mode without actually creating invoices.')
-    parser.add_argument('-i', '--inspect', action='store_true', help='Dump payload for Lexware API to the console for inspection. Only works in test mode.')
-
+    parser.add_argument('-l', '--logging', action='store_true', help='Output log to a file in the same directory.')
     args = parser.parse_args()
-    import_date = args.date.date() if args.date else datetime.date.today() - datetime.timedelta(days=1)
-    test_mode = args.test 
-    test_inspect = args.inspect
 
-    if test_mode:
-        logger.warning('Running in test mode. No invoices will be created.')
+    if args.date:
+        global IMPORT_DATE
+        IMPORT_DATE = args.date.date() 
+
+    if args.test:
+        global TEST_MODE
+        TEST_MODE = args.test 
+
+    if args.logging:
+        global LOGGING_ENABLED
+        LOGGING_ENABLED = args.logging
+
+    # Set up logging to file if requested. 
+    if LOGGING_ENABLED:
+        LOGGER.setLevel(logging.DEBUG)
+
+        file_handler = RotatingFileHandler(LOGFILE_NAME, maxBytes=1024*1024, backupCount=5)
+        file_handler.setLevel(logging.DEBUG)
+
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+
+        LOGGER.addHandler(file_handler)
+
+    message = ''
+
+    if TEST_MODE:
+        message = 'Running in test mode. No invoices will be created.'
+        CONSOLE.print(Panel(message, title='TEST MODE', style='bold yellow'))
+        log(message, logging.WARNING)
 
     # Get transactions for the specified date from pretix. The invoice endpoint has no date filter, 
     # but a filter for order numbers. Therefore, we first fetch all transactions for the specified date, 
     # filter out unique order numbers and then fetch all invoices for those orders. The list of invoices 
     # is then filtered by the specified date to get only the relevant invoices created on that date.
-    logger.info(f'Fetching transactions for {import_date}...')
-    transactions = get_transactions(import_date)
+    with CONSOLE.status(f'Fetching transactions for {IMPORT_DATE}...'):
+        transactions = get_transactions(IMPORT_DATE)
 
     # If no transactions are found, leave the program.
     if len(transactions) == 0:
-        logger.info(f'No transactions received for {import_date}. Leaving program.')
+        message = f'No transactions received for {IMPORT_DATE}. Leaving program.'
+        CONSOLE.log(message, style='bold yellow')
+        log(message, logging.INFO)
         return
 
     # There can be more than one transaction per order on a single day, so we need to filter out duplicates.
     # The unique list of orders is necessary to fetch the invoices for each order. 
-    relevant_orders = set()
+    relevant_orders_unique = set()
 
     for transaction in transactions:
-        relevant_orders.add(transaction['order'])
+        relevant_orders_unique.add(transaction['order'])
 
-    logger.info(f'Fetching invoices for {len(relevant_orders)} orders...')
+    relevant_orders = list(relevant_orders_unique)
 
-    invoices_to_import = []
+    with Progress() as prg_get_invoices:
+        message = f'Fetching invoices for {len(relevant_orders)} orders...'
+        task_get_invoice = prg_get_invoices.add_task(message, total=len(relevant_orders))
+        log(message, logging.INFO)
+        
+        invoices_to_import = []
 
-    for order in relevant_orders:
-        invoices = get_invoices(order)
-        for invoice in invoices:
-            if invoice['date'] == import_date.strftime('%Y-%m-%d'):
-                invoices_to_import.append(invoice)
-                logger.info(f"Invoice {invoice['number']} for order {order} noted for import")
-            else: 
-                logger.info(f"Invoice {invoice['number']} for order {order} created on {invoice['date']}")
+        tbl_fetched_invoices = Table(title='Fetched Invoices')
+        tbl_fetched_invoices.add_column('Invoice Number', style='cyan', no_wrap=True)
+        tbl_fetched_invoices.add_column('Order', no_wrap=True)
+        tbl_fetched_invoices.add_column('Invoice Date', no_wrap=True)
+        tbl_fetched_invoices.add_column('Status', no_wrap=True)
+
+        while not prg_get_invoices.finished:
+            order = relevant_orders.pop(0)
+            invoices = get_invoices(order)
+            for invoice in invoices:
+                if invoice['date'] == IMPORT_DATE.strftime('%Y-%m-%d'):
+                    invoices_to_import.append(invoice)
+                    tbl_fetched_invoices.add_row(invoice['number'], order, IMPORT_DATE.strftime('%Y-%m-%d'), '[bold green]to be imported')
+                    log(f'Invoice {invoice["number"]} for order {order} noted for import', logging.INFO)
+                else: 
+                    tbl_fetched_invoices.add_row(invoice['number'], order, IMPORT_DATE.strftime('%Y-%m-%d'), '[bold yellow]no import')
+                    log(f'Invoice {invoice["number"]} for order {order} created on {invoice["date"]}, no import', logging.INFO)
+
+            prg_get_invoices.update(task_get_invoice, advance=1)
+
+    CONSOLE.print(tbl_fetched_invoices)
 
     # Leave program if there are no invoices to import. 
     if len(invoices_to_import) == 0:
-        logger.info(f'No invoices to import for {import_date}. Leaving program.')
+        message = f'No invoices to import for {IMPORT_DATE}. Leaving program.'
+        CONSOLE.log(message, style='bold yellow')
+        log(message, logging.INFO)
         return
-    else:
-        logger.info(f'Importing {len(invoices_to_import)} invoices...')
 
     total_invoices = len(invoices_to_import)
     import_failed = 0
     import_successful = 0
 
-    for invoice in invoices_to_import:
-        logger.info(f"Importing invoice {invoice['number']} for order {invoice['order']}...")
+    tbl_imp_invoices = Table(title='Imported Invoices')
+    tbl_imp_invoices.add_column('Invoice Number', style='cyan', no_wrap=True)
+    tbl_imp_invoices.add_column('Order', no_wrap=True)
+    tbl_imp_invoices.add_column('Invoice Date', no_wrap=True)
+    tbl_imp_invoices.add_column('Status', no_wrap=True)
 
-        # The Lexware API has a rate limit of 2 requests per second. If the limit is exceeded, the API returns a 429 status code.
-        # We will retry the request in that case, up to a maximum number of attempts defined in the environment variable 
-        # LEXWARE_RETRY_COUNT, and wait 2 seconds.
-        attempts = 0
-        while (attempts <= int(os.environ.get('LEXWARE_RETRY_COUNT'))):  # type: ignore
+    with Progress() as prg_post_invoices:
+        message = f'Importing {total_invoices} invoices...'
+        task_post_invoice = prg_post_invoices.add_task(message, total=total_invoices)
+        log(message, logging.INFO)
 
-            attempts += 1
+        while not prg_post_invoices.finished:
+            invoice = invoices_to_import.pop(0)  # Get the next invoice to import
 
-            # In test mode, the Lexware API will not be called and the payload will be logged to the console for inspection
-            # if requested. 
-            if test_mode: 
-                logger.info(f"Invoice {invoice['number']} not imported (test mode).")
-                if test_inspect:
-                    logger.info(f"Payload for invoice {invoice['number']}:\n{json.dumps(convert_invoice(invoice), indent=2)}")
-                continue
+            # The Lexware API has a rate limit of 2 requests per second. If the limit is exceeded, the API returns a 429 status code.
+            # We will retry the request in that case, up to a maximum number of attempts defined in the environment variable 
+            # LEXWARE_RETRY_COUNT, and wait 2 seconds.
+            attempts = 0
 
-            result = create_voucher(convert_invoice(invoice))
+            while (attempts <= int(os.environ.get('LEXWARE_RETRY_COUNT'))):  # type: ignore
 
-            if result.ok: 
-                # Document has been created, exit loop.
-                logger.info(f"Invoice {invoice['number']} imported successfully.")
-                import_successful += 1
-                break
-            elif result.status_code == 429:
-                # Rate limit exceeded, wait and try again 
-                time.sleep(2)
-                logger.warning(f"API rate limit exceeded (status {result.status_code}). Will try again {int(os.environ.get('LEXWARE_RETRY_COUNT')) - attempts} more time(s).") # type: ignore
-                continue
-            else: 
-                # Document creation failed for a different reason, exit loop.
-                logger.error(f"Failed to import invoice {invoice['number']}: {result.status_code} {result.text}")
-                import_failed += 1
-                break
+                attempts += 1
 
-    logger.info(f'Import summary for {import_date}: {import_successful} successful, {import_failed} failed out of {total_invoices} total.')
+                # In test mode, the Lexware API will not be called and the payload will be logged to the console for inspection
+                # if requested. 
+                if TEST_MODE: 
+                    tbl_imp_invoices.add_row(invoice['number'], order, IMPORT_DATE.strftime('%Y-%m-%d'), '[bold green]no import (test mode)')
+                    import_successful += 1
+                    prg_post_invoices.update(task_post_invoice, advance=1)
+                    log(f'Invoice {invoice["number"]} not imported (test mode).', logging.INFO)
+                    break
+
+                result = create_voucher(convert_invoice(invoice))
+
+                if result.ok: 
+                    # Document has been created, exit loop.
+                    tbl_imp_invoices.add_row(invoice['number'], order, IMPORT_DATE.strftime('%Y-%m-%d'), '[bold green]successful')
+                    log(f'Invoice {invoice["number"]} imported successfully.', logging.INFO)
+                    import_successful += 1
+                    prg_post_invoices.update(task_post_invoice, advance=1)
+                    break
+                elif result.status_code == 429:
+                    # Rate limit exceeded, wait and try again 
+                    time.sleep(2)
+                    message = f'API rate limit exceeded (status {result.status_code}). Will try again {int(os.environ.get("LEXWARE_RETRY_COUNT")) - attempts} more time(s).' # type: ignore
+                    CONSOLE.log(message, style='bold yellow') 
+                    log(message, logging.WARNING) 
+                    continue
+                else: 
+                    # Document creation failed for a different reason, exit loop.
+                    tbl_imp_invoices.add_row(invoice['number'], order, IMPORT_DATE.strftime('%Y-%m-%d'), '[bold red]failed')
+                    log(f'Failed to import invoice {invoice["number"]}: {result.status_code} {result.text}', logging.ERROR)
+                    import_failed += 1
+                    prg_post_invoices.update(task_post_invoice, advance=1)
+                    break
+
+    CONSOLE.print(tbl_imp_invoices)
+
+    CONSOLE.log(f'Import summary for {IMPORT_DATE}:', style='bold')
+
+    stats = [   Panel(f'{import_successful}', title='Successful', style='bold green'),
+                Panel(f'{import_failed}', title='Failed', style='bold red'),
+                Panel(f'{total_invoices}', title='Total', style='bold')]
+
+    CONSOLE.log(Columns(stats))
+
+    log(f'Import summary for {IMPORT_DATE}: {import_successful} successful, {import_failed} failed out of {total_invoices} total.', logging.INFO)
 
 def get_transactions(date: datetime.date):
     """Fetches transactions from the pretix API for a given date.
@@ -216,12 +295,13 @@ def get_transactions(date: datetime.date):
     response = requests.request('GET', url, headers=headers, data={})
 
     if response.status_code != 200:
-        logger.error(f'Failed to fetch transactions: {response.status_code} - {response.text}')
+        CONSOLE.log(f'[bold red]Failed to fetch transactions: {response.status_code} - {response.text}')
+        log(f'[bold red]Failed to fetch transactions: {response.status_code} - {response.text}', logging.ERROR)
         return []
     else:
-        logger.info(f"Successfully fetched {json.loads(response.text)['count']} transactions for {date}")
-
-    return(json.loads(response.text)['results'])
+        CONSOLE.log(f'[bold green]Successfully fetched {json.loads(response.text)["count"]} transactions for {date}')
+        log(f'[bold green]Successfully fetched {json.loads(response.text)["count"]} transactions for {date}', logging.INFO)
+        return(json.loads(response.text)['results'])
 
 def get_invoices(order: str):
     """Fetches invoices from the pretix API for a given order.
@@ -236,6 +316,17 @@ def get_invoices(order: str):
     response = requests.request('GET', url, headers=headers, data={})
 
     return(json.loads(response.text)['results'])
+
+def replace_placeholders(text, invoice):
+    """Replace placeholders matching invoice keys, such as %order%, in text.
+    
+    Keyword arguments:
+    text    -- the text with placeholders from the .env file 
+    invoice -- the pretix invoice to convert (JSON object), see API documentation for details on the JSON structure    
+    """
+    for key, value in invoice.items():
+        text = text.replace(f'%{key}%', str(value))
+    return text
 
 def convert_invoice(invoice):
     """Converts a pretix invoice to the format required by the Lexware API.
@@ -263,6 +354,23 @@ def convert_invoice(invoice):
             'categoryId': PSTNG_CATEGORY_ID_SALES,
         })
 
+    voucher_text = replace_placeholders(
+        os.environ.get(
+            'VOUCHER_TEXT',
+            'Order %order% for event %event%,\n %invoice_to_name%, %invoice_to_street%, %invoice_to_zipcode% %invoice_to_city%, %invoice_to_country%',
+        ), invoice 
+        )
+
+    cancellation_prefix = (
+        replace_placeholders(os.environ.get('VOUCHER_ADDT_CANCELATION', 'Cancelation '), invoice)
+        if invoice['is_cancellation'] == True else ''
+    )
+
+    reference = (
+        replace_placeholders(os.environ.get( 'VOUCHER_ADDT_REFERENCE', 'Reference: %refers%'), invoice)
+        if invoice['refers'] is not None else ''
+    )
+
     return json.dumps({
         'type': 'salesinvoice' if invoice['is_cancellation'] == False else 'salescreditnote',
         'voucherNumber': invoice['number'],
@@ -273,7 +381,7 @@ def convert_invoice(invoice):
         'totalTaxAmount': round(total_tax, 2),
         'taxType': 'gross',
         'useCollectiveContact': True,
-        'remark': f"{ 'Storno ' if invoice['is_cancellation'] == True else '' }Bestellung {invoice['order']} zu Veranstaltung {invoice['event']}\n{invoice['invoice_to_name']}, {invoice['invoice_to_street']}, {invoice['invoice_to_zipcode']} {invoice['invoice_to_city']}, {invoice['invoice_to_country']}{f'\nReferenzbelegnummer: {invoice['refers']}' if invoice['refers'] != None else ''}",
+        'remark': f'{cancellation_prefix}{voucher_text}{reference}',
         'voucherItems': items
     })
 
@@ -293,6 +401,21 @@ def create_voucher(voucher):
     response = requests.request('POST', os.environ.get('LEXWARE_API_URL') + '/vouchers', headers=headers, data=voucher)  # type: ignore
 
     return response
+
+def log(message, level):
+
+    if not LOGGING_ENABLED:
+        return
+
+    match level:
+        case logging.DEBUG:
+            LOGGER.debug(message)
+        case logging.INFO:
+            LOGGER.info(message)
+        case logging.WARNING:
+            LOGGER.warning(message)
+        case logging.ERROR:
+            LOGGER.error(message)
 
 if __name__ == '__main__':
     main()
