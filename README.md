@@ -16,13 +16,13 @@ The script relies on the following environment variables to be set:
 - LEXWARE_API_URL: The base URL of the Lexware API (e.g. https://api.lexware.io/v1).
 - LEXWARE_API_KEY: The API key for the Lexware API.
 - LEXWARE_RETRY_COUNT: Number of times the script should retry creating a voucher in case the request is rejected due to the [rate limit](https://developers.lexware.io/docs/#api-rate-limits)
-The script uses dotenv, so a .env-file in the same directory will be sufficient.
+The script uses dotenv, so a .env-file in the same directory will be sufficient. A sample .env file is supplied within the project files. 
 
 There are three more environment variables for adjusting the [voucher text](https://developers.lexware.io/docs/#vouchers-endpoint-voucher-properties) (remark): 
 - VOUCHER_TEXT: The general voucher text which is added to all requests. 
 - VOUCHER_ADDT_CANCELATION: Additional text which will be added *in front of* the general text in case the invoice is a credit note/cancelation. 
 - VOUCHER_ADDT_REFERENCE: Additional text which will be added *at the end of* the general text in case the invoice refers to another document. 
-These will be overwritten with default values if they are not present. Placeholders which refer to properties of the [pretix invoice endpoint](https://docs.pretix.eu/dev/api/resources/invoices.html) can be used. For more information, please read the respective section below. 
+These will be overwritten with default values if they are not present. Placeholders which refer to properties of the [pretix invoice endpoint](https://docs.pretix.eu/dev/api/resources/invoices.html) can be used. For more information, please read the respective section below.
 
 The Lexware API URL remains static, the pretix API URL is event-specific and must be set accordingly. 
 You will need to run this script multiple times for each event if you want to handle multiple events.
