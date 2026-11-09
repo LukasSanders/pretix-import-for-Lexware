@@ -174,7 +174,7 @@ def main():
 
     relevant_orders = list(relevant_orders_unique)
 
-    with Progress() as prg_get_invoices:
+    with Progress(expand=True) as prg_get_invoices:
         message = f'Fetching invoices for {len(relevant_orders)} orders...'
         task_get_invoice = prg_get_invoices.add_task(message, total=len(relevant_orders))
         log(message, logging.INFO)
@@ -210,23 +210,61 @@ def main():
         log(message, logging.INFO)
         return
 
-    total_invoices = len(invoices_to_import)
+    # Convert invoices to voucher objects for the Lexware API. 
+    vouchers = []
+
+    with Progress(expand=True) as prg_convert_invoices:
+        message = f'Converting {len(invoices_to_import)} invoices to vouchers...'
+        task_convert_invoice = prg_convert_invoices.add_task(message, total=len(invoices_to_import))
+        log(message, logging.INFO)
+
+        while not prg_convert_invoices.finished:
+            invoice = invoices_to_import.pop(0)  # Get the next invoice to convert
+            vouchers.append(json.loads(convert_invoice(invoice)))  # Convert the invoice to a voucher object
+            prg_convert_invoices.update(task_convert_invoice, advance=1)
+
+    # Chech the order for used gift cards and create additional vouchers to reverse the purchase. 
+    relevant_orders = list(relevant_orders_unique)
+
+    with Progress(expand=True) as prg_giftcards:
+        message = f'Checking {len(relevant_orders)} orders for used gift cards...'
+        task_giftcard_check = prg_giftcards.add_task(message, total=len(relevant_orders))
+        log(message, logging.INFO)
+
+        while not prg_giftcards.finished:
+            order = relevant_orders.pop(0)
+            order_details = get_order(order)
+            for payment in order_details.get('payments', []):
+                if payment.get('provider') != 'giftcard':
+                    continue
+                payment_date = payment.get('payment_date')
+                if payment_date and datetime.datetime.fromisoformat(payment_date).date() == IMPORT_DATE:
+                    vouchers.append(create_giftcard_voucher(order_details, payment))
+                    log(
+                        f'Gift card payment {payment["local_id"]} for order {order} noted for reversal.',
+                        logging.INFO,
+                    )
+            prg_giftcards.update(task_giftcard_check, advance=1)
+
+    total_invoices = len(vouchers)
     import_failed = 0
     import_successful = 0
 
     tbl_imp_invoices = Table(title='Imported Invoices')
     tbl_imp_invoices.add_column('Invoice Number', style='cyan', no_wrap=True)
-    tbl_imp_invoices.add_column('Order', no_wrap=True)
+    tbl_imp_invoices.add_column('Type', no_wrap=True)
     tbl_imp_invoices.add_column('Invoice Date', no_wrap=True)
+    tbl_imp_invoices.add_column('Gross Amount', no_wrap=True, justify='right')
+    tbl_imp_invoices.add_column('Tax Amount', no_wrap=True, justify='right')
     tbl_imp_invoices.add_column('Status', no_wrap=True)
 
-    with Progress() as prg_post_invoices:
+    with Progress(expand=True) as prg_post_invoices:
         message = f'Importing {total_invoices} invoices...'
         task_post_invoice = prg_post_invoices.add_task(message, total=total_invoices)
         log(message, logging.INFO)
 
         while not prg_post_invoices.finished:
-            invoice = invoices_to_import.pop(0)  # Get the next invoice to import
+            voucher = vouchers.pop(0)  # Get the next voucher to import
 
             # The Lexware API has a rate limit of 2 requests per second. If the limit is exceeded, the API returns a 429 status code.
             # We will retry the request in that case, up to a maximum number of attempts defined in the environment variable 
@@ -237,21 +275,20 @@ def main():
 
                 attempts += 1
 
-                # In test mode, the Lexware API will not be called and the payload will be logged to the console for inspection
-                # if requested. 
+                # In test mode, the Lexware API will not be called.
                 if TEST_MODE: 
-                    tbl_imp_invoices.add_row(invoice['number'], order, IMPORT_DATE.strftime('%Y-%m-%d'), '[bold green]no import (test mode)')
+                    tbl_imp_invoices.add_row(voucher['voucherNumber'], voucher['type'], IMPORT_DATE.strftime('%Y-%m-%d'), f'{voucher["totalGrossAmount"]:.2f}', f'{voucher["totalTaxAmount"]:.2f}', '[bold green]no import (test mode)')
                     import_successful += 1
                     prg_post_invoices.update(task_post_invoice, advance=1)
-                    log(f'Invoice {invoice["number"]} not imported (test mode).', logging.INFO)
+                    log(f'Invoice {voucher["voucherNumber"]} not imported (test mode).', logging.INFO)
                     break
 
-                result = create_voucher(convert_invoice(invoice))
+                result = create_voucher(json.dumps(voucher))
 
                 if result.ok: 
                     # Document has been created, exit loop.
-                    tbl_imp_invoices.add_row(invoice['number'], order, IMPORT_DATE.strftime('%Y-%m-%d'), '[bold green]successful')
-                    log(f'Invoice {invoice["number"]} imported successfully.', logging.INFO)
+                    tbl_imp_invoices.add_row(voucher['voucherNumber'], voucher['type'], IMPORT_DATE.strftime('%Y-%m-%d'), f'{voucher["totalGrossAmount"]:.2f}', f'{voucher["totalTaxAmount"]:.2f}', '[bold green]successful')
+                    log(f'Invoice {voucher["voucherNumber"]} imported successfully.', logging.INFO)
                     import_successful += 1
                     prg_post_invoices.update(task_post_invoice, advance=1)
                     break
@@ -264,8 +301,8 @@ def main():
                     continue
                 else: 
                     # Document creation failed for a different reason, exit loop.
-                    tbl_imp_invoices.add_row(invoice['number'], order, IMPORT_DATE.strftime('%Y-%m-%d'), '[bold red]failed')
-                    log(f'Failed to import invoice {invoice["number"]}: {result.status_code} {result.text}', logging.ERROR)
+                    tbl_imp_invoices.add_row(voucher['voucherNumber'], voucher['type'], IMPORT_DATE.strftime('%Y-%m-%d'), f'{voucher["totalGrossAmount"]:.2f}', f'{voucher["totalTaxAmount"]:.2f}', '[bold red]failed')
+                    log(f'Failed to import invoice {voucher["voucherNumber"]}: {result.status_code} {result.text}', logging.ERROR)
                     import_failed += 1
                     prg_post_invoices.update(task_post_invoice, advance=1)
                     break
@@ -316,6 +353,44 @@ def get_invoices(order: str):
     response = requests.request('GET', url, headers=headers, data={})
 
     return(json.loads(response.text)['results'])
+
+def get_order(order: str):
+    """Fetches an order from the pretix API.
+
+    Keyword arguments:
+    order -- the order to fetch
+    """
+
+    url = os.environ.get('PRETIX_RESOURCE_URL') + '/orders/' + order # type: ignore
+    headers = {'Authorization': 'Token ' + os.environ.get('PRETIX_API_KEY')} # type: ignore
+
+    response = requests.request('GET', url, headers=headers, data={})
+
+    return(json.loads(response.text))
+
+def create_giftcard_voucher(order, payment):
+    """Create a voucher to reverse a gift card purchase."""
+
+    amount = round(float(payment['amount'].replace('-', '')), 2)
+
+    return {
+        'type': 'salescreditnote',
+        'voucherNumber': f'GIFT-{order["code"]}-{payment["local_id"]:03d}',
+        'voucherDate': IMPORT_DATE.strftime('%Y-%m-%d'),
+        'shippingDate': IMPORT_DATE.strftime('%Y-%m-%d'),
+        'dueDate': IMPORT_DATE.strftime('%Y-%m-%d'),
+        'totalGrossAmount': amount,
+        'totalTaxAmount': 0.0,
+        'taxType': 'gross',
+        'useCollectiveContact': True,
+        'remark': replace_placeholders(os.environ.get('VOUCHER_TEXT_GIFTCARD', ''), order),
+        'voucherItems': [{
+            'amount': amount,
+            'taxAmount': 0.0,
+            'taxRatePercent': 0,
+            'categoryId': PSTNG_CATEGORY_ID_SALES,
+        }]
+    }
 
 def replace_placeholders(text, invoice):
     """Replace placeholders matching invoice keys, such as %order%, in text.
