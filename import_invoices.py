@@ -387,7 +387,7 @@ def create_giftcard_voucher(order, payment):
             'amount': amount,
             'taxAmount': 0.0,
             'taxRatePercent': 0,
-            'categoryId': SETTINGS['lexware']['posting_category'],
+            'categoryId': SETTINGS['api_settings']['lexware']['posting_category'],
         }]
     }
 
@@ -425,7 +425,7 @@ def convert_invoice(invoice):
             'amount': gross_amount,
             'taxAmount': tax_amount,
             'taxRatePercent': int(round(float(item['tax_rate']), 0)),
-            'categoryId': SETTINGS['lexware']['posting_category'],
+            'categoryId': SETTINGS['api_settings']['lexware']['posting_category'],
         })
 
     voucher_text = replace_placeholders(
