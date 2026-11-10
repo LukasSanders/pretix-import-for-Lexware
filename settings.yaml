@@ -3,8 +3,10 @@ api_settings:
     api_url: "https://api.lexware.io/v1"
     retry_count: 3
     posting_category: "8f8664a8-fd86-11e1-a21f-0800200c9a66"
+    api_key: "<YOUR_SECRET_API_KEY>"
   pretix:
     resource_url: "https://pretix.organiser.example/api/v1/organizers/ORGANISER/events/EVENT"
+    api_token: "<YOUR_SECRET_API_TOKEN>"
 texts:
   voucher: "Order %order% for event %event%\n%invoice_to_name%, %invoice_to_street%, %invoice_to_zip%, %invoice_to_city%, %invoice_to_country%"
   cancellation: 'Cancelation '

@@ -1,0 +1,26 @@
+#!/bin/sh
+
+repo_root=$(git rev-parse --show-toplevel) || exit 1
+cd "$repo_root" || exit 1
+
+git diff --cached --quiet -- settings.yaml
+settings_status=$?
+if [ "$settings_status" -eq 0 ]; then
+    exit 0
+elif [ "$settings_status" -ne 1 ]; then
+    echo "Commit blocked: unable to inspect staged settings.yaml." >&2
+    exit "$settings_status"
+fi
+
+if [ -f "$repo_root/.venv/Scripts/python.exe" ]; then
+    "$repo_root/.venv/Scripts/python.exe" scripts/check_settings.py
+elif [ -f "$repo_root/.venv/bin/python" ]; then
+    "$repo_root/.venv/bin/python" scripts/check_settings.py
+elif command -v python >/dev/null 2>&1; then
+    python scripts/check_settings.py
+elif command -v python3 >/dev/null 2>&1; then
+    python3 scripts/check_settings.py
+else
+    echo "Commit blocked: Python is required to validate settings.yaml." >&2
+    exit 1
+fi

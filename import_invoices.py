@@ -11,7 +11,7 @@ All vouchers will be creating using the same posting category which is specified
 
 Setup & Use
 -----------
-Settings are read from settings.yaml; only PRETIX_API_KEY and LEXWARE_API_KEY are read from environment variables.
+Settings and API credentials are read from settings.yaml.
 
 The Lexware API URL remains static, the pretix API URL is event-specific and must be set accordingly. 
 You will need to run this script multiple times for each event if you want to handle multiple events.
@@ -68,14 +68,12 @@ OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED O
 
 import requests
 import json
-import os
 import datetime
 import time
 import argparse
 import logging
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
-from dotenv import load_dotenv
 import yaml
 from rich.console import Console
 from rich.progress import Progress
@@ -83,16 +81,65 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.columns import Columns
 
+class LexwareSettings:
+    def __init__(self, api_key, api_url, posting_category, retry_count=3):
+        self.api_key = api_key
+        self.api_url = api_url
+        self.posting_category = posting_category
+        self.retry_count = retry_count
+
+class PretixSettings:
+    def __init__(self, resource_url, api_token):
+        self.resource_url = resource_url
+        self.api_token = api_token
+
+class TextSettings:
+    def __init__(self, voucher, cancellation, reference, giftcard):
+        self.voucher = voucher
+        self.cancellation = cancellation
+        self.reference = reference
+        self.giftcard = giftcard
+
+class Settings:
+    def __init__(self, settings):
+
+        self.import_date = datetime.date.today() - datetime.timedelta(days=1)
+        self.test_mode = False
+        self.logging_enabled = False
+        self.logfile_name = 'pretix_to_lexware.log'
+
+        try:
+            self.pretix = PretixSettings(
+                resource_url=settings['api_settings']['pretix']['resource_url'],
+                api_token=settings['api_settings']['pretix']['api_token']
+            )
+            self.lexware = LexwareSettings(
+                api_key=settings['api_settings']['lexware']['api_key'],
+                api_url=settings['api_settings']['lexware']['api_url'],
+                posting_category=settings['api_settings']['lexware']['posting_category'],
+                retry_count=settings['api_settings']['lexware']['retry_count'] if settings['api_settings']['lexware']['retry_count'] else 3
+            )
+
+        except KeyError as e:
+            raise KeyError(f"Missing required setting: {e}. Please check your settings.yaml file.")
+        
+        self.texts = TextSettings(
+            voucher=settings['texts']['voucher'] if settings['texts']['voucher'] else "Order %order% for event %event%\n%invoice_to_name%, %invoice_to_street%, %invoice_to_zip%, %invoice_to_city%, %invoice_to_country%",
+            cancellation=settings['texts']['cancellation'] if settings['texts']['cancellation'] else "Cancellation ",
+            reference=settings['texts']['reference'] if settings['texts']['reference'] else "\nReference: %refers%",
+            giftcard=settings['texts']['giftcard'] if settings['texts']['giftcard'] else "Reversal of gift card payment for order %order%"
+        )
+
+    def set_test_mode(self, active: bool):
+        self.test_mode = active
+
+    def set_logging(self, enabled: bool):
+        self.logging_enabled = enabled
+
 CONSOLE = Console()
 LOGGER = LOGGER = logging.getLogger(__name__)
 IMPORT_DATE = datetime.date.today() - datetime.timedelta(days=1)
-TEST_MODE = False
-LOGGING_ENABLED = False
-LOGFILE_NAME = 'pretix_to_lexware.log'
-
-load_dotenv()
-
-SETTINGS = {}
+SETTINGS: Settings
 
 def main():
     """Main function to handle the invoice import. 
@@ -103,6 +150,8 @@ def main():
     -l, --logging          Create a log file in the same directory. 
     -s, --settings-file    Path to the settings file if different from the default location (default: ./settings.yaml).
     """
+
+    message = '' # Message variable for logging and console output. 
 
     # Set up and retrieve command line arguments.
     parser = argparse.ArgumentParser(description='Import invoices from pretix to Lexware for a specified date.')
@@ -115,27 +164,83 @@ def main():
                         help='Path to the settings file if different from the default location (default: ./settings.yaml).')
     args = parser.parse_args()
 
-    global SETTINGS
-    with Path(args.settings_file).open(encoding='utf-8') as settings_file:
-        SETTINGS = yaml.safe_load(settings_file)
+    # Try to open the settings file, either the default or the one specified via command line argument, and parse the content.
+    # If the file is not found or cannot be parsed, log an error and exit.
+    try:
+        global SETTINGS
+        with Path(args.settings_file).open(encoding='utf-8') as settings_file:
+            SETTINGS = Settings(yaml.safe_load(settings_file))
+    except FileNotFoundError:
+        message = f"Settings file not found under {args.settings_file}. Please ensure the settings file exists and is accessible."
+        CONSOLE.log(message, style='bold red')
+        log(message, logging.ERROR)
+        return
+    except yaml.YAMLError as e:
+        message = f"Error parsing the settings file: {e}. Please ensure the settings file is valid YAML."
+        CONSOLE.log(message, style='bold red')
+        log(message, logging.ERROR)
+        return
+    except KeyError as e:
+        message = f"{e}"
+        CONSOLE.log(message, style='bold red')
+        log(message, logging.ERROR)
+        return
 
+    # Check if all required settings (which are not overwritten by default values) are present in the settings file. 
+    # If any are missing, log an error and exit.
+    if not SETTINGS.pretix.resource_url or not SETTINGS.pretix.api_token:
+        message = "Pretix API settings are missing or incomplete in the settings file. Please provide the resource URL and API token."
+        CONSOLE.log(message, style='bold red')
+        log(message, logging.ERROR)
+        return
+
+    if not SETTINGS.lexware.api_url or not SETTINGS.lexware.api_key or not SETTINGS.lexware.posting_category or not SETTINGS.lexware.retry_count:
+        message = "Lexware API settings are missing or incomplete in the settings file. Please provide the API URL and API key."
+        CONSOLE.log(message, style='bold red')
+        log(message, logging.ERROR)
+        return
+
+    # Try to parse the date and check if it in the past. If the date is invalid or in the future, log an error and exit.
     if args.date:
-        global IMPORT_DATE
-        IMPORT_DATE = args.date.date() 
+        try: 
+            global IMPORT_DATE
+            IMPORT_DATE = args.date.date() 
+        except ValueError:
+            message = f"Invalid date format: {args.date}. Please use YYYY-MM-DD."
+            CONSOLE.log(message, style='bold red')
+            log(message, logging.ERROR)
+            return
+        except Exception as e:
+            message = f"An unexpected error occurred while processing the date: {e}"
+            CONSOLE.log(message, style='bold red')
+            log(message, logging.ERROR)
+            return
+        if datetime.date.today() < IMPORT_DATE:
+            message = f"Specified date {IMPORT_DATE} is today or in the future. Please specify a past date."
+            CONSOLE.log(message, style='bold red')
+            log(message, logging.ERROR)
+            return
 
+    # Activate logging and/or test mode if requested. 
     if args.test:
-        global TEST_MODE
-        TEST_MODE = args.test 
+        global SETTINGS
+        SETTINGS.set_test_mode(args.test)
 
     if args.logging:
-        global LOGGING_ENABLED
-        LOGGING_ENABLED = args.logging
+        global SETTINGS
+        SETTINGS.set_logging(args.logging)
 
     # Set up logging to file if requested. 
-    if LOGGING_ENABLED:
+    if SETTINGS.logging_enabled:
         LOGGER.setLevel(logging.DEBUG)
 
-        file_handler = RotatingFileHandler(LOGFILE_NAME, maxBytes=1024*1024, backupCount=5)
+        try:
+            file_handler = RotatingFileHandler(SETTINGS.logfile_name, maxBytes=1024*1024, backupCount=5)
+        except Exception as e:
+            message = f"Failed to set up logging to file: {e}. Please check file permissions and available disk space."
+            CONSOLE.log(message, style='bold red')
+            log(message, logging.ERROR)
+            return
         file_handler.setLevel(logging.DEBUG)
 
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -143,9 +248,7 @@ def main():
 
         LOGGER.addHandler(file_handler)
 
-    message = ''
-
-    if TEST_MODE:
+    if SETTINGS.test_mode:
         message = 'Running in test mode. No invoices will be created.'
         CONSOLE.print(Panel(message, title='TEST MODE', style='bold yellow'))
         log(message, logging.WARNING)
@@ -173,6 +276,7 @@ def main():
 
     relevant_orders = list(relevant_orders_unique)
 
+    # Fetch invoices for each order and filter by the specified date.
     with Progress(expand=True) as prg_get_invoices:
         message = f'Fetching invoices for {len(relevant_orders)} orders...'
         task_get_invoice = prg_get_invoices.add_task(message, total=len(relevant_orders))
@@ -234,8 +338,10 @@ def main():
             order = relevant_orders.pop(0)
             order_details = get_order(order)
             for payment in order_details.get('payments', []):
+                # If a gift card was used, there is an entry in the payments array with the provider "giftcard". 
                 if payment.get('provider') != 'giftcard':
                     continue
+                # Make sure the gift card has been applied on the correct (import) date. 
                 payment_date = payment.get('payment_date')
                 if payment_date and datetime.datetime.fromisoformat(payment_date).date() == IMPORT_DATE:
                     vouchers.append(create_giftcard_voucher(order_details, payment))
@@ -257,6 +363,7 @@ def main():
     tbl_imp_invoices.add_column('Tax Amount', no_wrap=True, justify='right')
     tbl_imp_invoices.add_column('Status', no_wrap=True)
 
+    # Post the vouchers to the Lexware API. 
     with Progress(expand=True) as prg_post_invoices:
         message = f'Importing {total_invoices} invoices...'
         task_post_invoice = prg_post_invoices.add_task(message, total=total_invoices)
@@ -270,12 +377,12 @@ def main():
             # LEXWARE_RETRY_COUNT, and wait 2 seconds.
             attempts = 0
 
-            while attempts <= SETTINGS['api_settings']['lexware']['retry_count']:
+            while attempts <= SETTINGS.lexware.retry_count:
 
                 attempts += 1
 
                 # In test mode, the Lexware API will not be called.
-                if TEST_MODE: 
+                if SETTINGS.test_mode: 
                     tbl_imp_invoices.add_row(voucher['voucherNumber'], voucher['type'], IMPORT_DATE.strftime('%Y-%m-%d'), f'{voucher["totalGrossAmount"]:.2f}', f'{voucher["totalTaxAmount"]:.2f}', '[bold green]no import (test mode)')
                     import_successful += 1
                     prg_post_invoices.update(task_post_invoice, advance=1)
@@ -294,7 +401,7 @@ def main():
                 elif result.status_code == 429:
                     # Rate limit exceeded, wait and try again 
                     time.sleep(2)
-                    message = f'API rate limit exceeded (status {result.status_code}). Will try again {SETTINGS["api_settings"]["lexware"]["retry_count"] - attempts} more time(s).'
+                    message = f'API rate limit exceeded (status {result.status_code}). Will try again {SETTINGS.lexware.retry_count - attempts} more time(s).'
                     CONSOLE.log(message, style='bold yellow') 
                     log(message, logging.WARNING) 
                     continue
@@ -325,8 +432,8 @@ def get_transactions(date: datetime.date):
     date -- the date for which to fetch transactions
     """
 
-    url = SETTINGS['api_settings']['pretix']['resource_url'] + '/transactions/?created_since=' + date.strftime('%Y-%m-%d') + 'T00:00:00Z'
-    headers = {'Authorization': 'Token ' + os.environ.get('PRETIX_API_KEY')} # type: ignore
+    url = SETTINGS.pretix.resource_url + '/transactions/?created_since=' + date.strftime('%Y-%m-%d') + 'T00:00:00Z'
+    headers = {'Authorization': 'Token ' + SETTINGS.pretix.api_token}
 
     response = requests.request('GET', url, headers=headers, data={})
 
@@ -346,8 +453,8 @@ def get_invoices(order: str):
     order -- the order for which to fetch invoices
     """
 
-    url = SETTINGS['api_settings']['pretix']['resource_url'] + '/invoices/?order=' + order
-    headers = {'Authorization': 'Token ' + os.environ.get('PRETIX_API_KEY')} # type: ignore
+    url = SETTINGS.pretix.resource_url + '/invoices/?order=' + order
+    headers = {'Authorization': 'Token ' + SETTINGS.pretix.api_token}
 
     response = requests.request('GET', url, headers=headers, data={})
 
@@ -360,15 +467,20 @@ def get_order(order: str):
     order -- the order to fetch
     """
 
-    url = SETTINGS['api_settings']['pretix']['resource_url'] + '/orders/' + order
-    headers = {'Authorization': 'Token ' + os.environ.get('PRETIX_API_KEY')} # type: ignore
+    url = SETTINGS.pretix.resource_url + '/orders/' + order
+    headers = {'Authorization': 'Token ' + SETTINGS.pretix.api_token}
 
     response = requests.request('GET', url, headers=headers, data={})
 
     return(json.loads(response.text))
 
 def create_giftcard_voucher(order, payment):
-    """Create a voucher to reverse a gift card purchase."""
+    """Create a voucher to reverse a gift card purchase.
+    
+    Keyword arguments:
+    order   -- the pretix order (JSON object), see API documentation for details
+    payment -- the pretix payment (JSON object), see API documentation for details
+    """
 
     amount = round(float(payment['amount'].replace('-', '')), 2)
 
@@ -382,12 +494,12 @@ def create_giftcard_voucher(order, payment):
         'totalTaxAmount': 0.0,
         'taxType': 'gross',
         'useCollectiveContact': True,
-        'remark': replace_placeholders(SETTINGS['texts']['giftcard'], order),
+        'remark': replace_placeholders(SETTINGS.texts.giftcard, order),
         'voucherItems': [{
             'amount': amount,
             'taxAmount': 0.0,
             'taxRatePercent': 0,
-            'categoryId': SETTINGS['api_settings']['lexware']['posting_category'],
+            'categoryId': SETTINGS.lexware.posting_category,
         }]
     }
 
@@ -425,20 +537,20 @@ def convert_invoice(invoice):
             'amount': gross_amount,
             'taxAmount': tax_amount,
             'taxRatePercent': int(round(float(item['tax_rate']), 0)),
-            'categoryId': SETTINGS['api_settings']['lexware']['posting_category'],
+            'categoryId': SETTINGS.lexware.posting_category,
         })
 
     voucher_text = replace_placeholders(
-        SETTINGS['texts']['voucher'], invoice
+        SETTINGS.texts.voucher, invoice
         )
 
     cancellation_prefix = (
-        replace_placeholders(SETTINGS['texts']['cancellation'], invoice)
+        replace_placeholders(SETTINGS.texts.cancellation, invoice)
         if invoice['is_cancellation'] == True else ''
     )
 
     reference = (
-        replace_placeholders(SETTINGS['texts']['reference'], invoice)
+        replace_placeholders(SETTINGS.texts.reference, invoice)
         if invoice['refers'] is not None else ''
     )
 
@@ -464,18 +576,18 @@ def create_voucher(voucher):
     """
 
     headers = {
-        'Authorization': 'Bearer ' + os.environ.get('LEXWARE_API_KEY'),  # type: ignore
+        'Authorization': 'Bearer ' + SETTINGS.lexware.api_key,
         'Accept': 'application/json',
         'Content-Type': 'application/json'
         }
 
-    response = requests.request('POST', SETTINGS['api_settings']['lexware']['api_url'] + '/vouchers', headers=headers, data=voucher)
+    response = requests.request('POST', SETTINGS.lexware.api_url + '/vouchers', headers=headers, data=voucher)
 
     return response
 
 def log(message, level):
 
-    if not LOGGING_ENABLED:
+    if not SETTINGS.logging_enabled:
         return
 
     match level:
