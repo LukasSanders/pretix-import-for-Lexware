@@ -10,19 +10,13 @@ Cancellation invoices will also be imported as sales credit notes.
 All vouchers will be creating using the same posting category which is specified as a constant in the script. 
 
 ## Setup & Use
-The script relies on the following environment variables to be set:
-- PRETIX_RESOURCE_URL: The base URL of the pretix API (e.g https://pretix.host.example/api/v1/organizers/[org]/events/[event])
-- PRETIX_API_KEY: The API key for the pretix API.
-- LEXWARE_API_URL: The base URL of the Lexware API (e.g. https://api.lexware.io/v1).
-- LEXWARE_API_KEY: The API key for the Lexware API.
-- LEXWARE_RETRY_COUNT: Number of times the script should retry creating a voucher in case the request is rejected due to the [rate limit](https://developers.lexware.io/docs/#api-rate-limits)
-The script uses dotenv, so a .env-file in the same directory will be sufficient.
+Install the dependencies with `pip install -r requirements.txt`. The script reads its non-secret settings from `settings.yaml` in the same directory. API URLs and retry count are grouped under `api_settings.lexware` and `api_settings.pretix`; voucher text templates are under `texts`.
 
-There are three more environment variables for adjusting the [voucher text](https://developers.lexware.io/docs/#vouchers-endpoint-voucher-properties) (remark): 
-- VOUCHER_TEXT: The general voucher text which is added to all requests. 
-- VOUCHER_ADDT_CANCELATION: Additional text which will be added *in front of* the general text in case the invoice is a credit note/cancelation. 
-- VOUCHER_ADDT_REFERENCE: Additional text which will be added *at the end of* the general text in case the invoice refers to another document. 
-These will be overwritten with default values if they are not present. Placeholders which refer to properties of the [pretix invoice endpoint](https://docs.pretix.eu/dev/api/resources/invoices.html) can be used. For more information, please read the respective section below. 
+The API keys are read from environment variables. To load them from a `.env` file, copy `env.sample` to `.env` and add your keys:
+- PRETIX_API_KEY: The API key for the pretix API.
+- LEXWARE_API_KEY: The API key for the Lexware API.
+
+The settings under `texts` in `settings.yaml` adjust the [voucher remark](https://developers.lexware.io/docs/#vouchers-endpoint-voucher-properties): the general text, additional cancellation text, reference text, and gift-card text. Placeholders which refer to properties of the [pretix invoice endpoint](https://docs.pretix.eu/dev/api/resources/invoices.html) can be used. For more information, please read the respective section below.
 
 The Lexware API URL remains static, the pretix API URL is event-specific and must be set accordingly. 
 You will need to run this script multiple times for each event if you want to handle multiple events.
@@ -36,6 +30,10 @@ The script can be called with the following command line arguments:
 -d, --date DATE        Date for which to import invoices (format: YYYY-MM-DD).
 -t, --test             Run in test mode without actually creating invoices.
 -l, --logging          Create a log file in the same directory. 
+-s, --settings-file    Path to the YAML settings file (defaults to ./settings.yaml).
+
+Use `-s` or `--settings-file` to load a configuration file from a different location, for example:
+`python import_invoices.py --settings-file path/to/settings.yaml`.
 
 If the import is handled manually, pass the date (format: YYYY-MM-DD) for which to import invoices. The argument
 may be omitted if invoices for yesterday are to be imported. If the script is run automatically (e.g. via cron job),
@@ -56,16 +54,16 @@ For further information on the pretix and Lexware APIs, please refer to the foll
 ## Voucher Texts 
 All vouchers (see [endpoint documentation](https://developers.lexware.io/docs/#vouchers-endpoint)) created in lexware will get a descriptive text (property "remark"). This text should give accountants, controllers or auditors a sufficient description of the nature and origin of the voucher resp. accounting document. It is also used for allocating bank transfers and it is searchable, so it is generally a good idea to add customer information or other reference numbers like the order number for clearing purposes. 
 
-The voucher text will be created according to the following three environment variables: 
-- VOUCHER_TEXT: The general voucher text which is added to all requests. 
-- VOUCHER_ADDT_CANCELATION: Additional text which will be added *in front of* the general text in case the invoice is a credit note/cancelation. 
-- VOUCHER_ADDT_REFERENCE: Additional text which will be added *at the end of* the general text in case the invoice refers to another document.
-They have default values and can include *placeholders* (see below). It is possible to include line breaks. 
+The voucher text is configured under `texts` in `settings.yaml`:
+- `voucher`: The general voucher text which is added to all requests.
+- `cancellation`: Additional text which will be added *in front of* the general text in case the invoice is a credit note/cancelation.
+- `reference`: Additional text which will be added *at the end of* the general text in case the invoice refers to another document.
+These settings can include *placeholders* (see below). It is possible to include line breaks.
 
 # Default Voucher Texts
-- VOUCHER_TEXT: 'Order %order% for event %event%,\n %invoice_to_name%, %invoice_to_street%, %invoice_to_zipcode% %invoice_to_city%, %invoice_to_country%' which includes the order number as well as the customer address 
-- VOUCHER_ADDT_CANCELATION: 'Cancelation '
-- VOUCHER_ADDT_REFERENCE: 'Reference: %refers%' which includes the reference document number
+- `VOUCHER_TEXT`: 'Order %order% for event %event%,\n %invoice_to_name%, %invoice_to_street%, %invoice_to_zipcode% %invoice_to_city%, %invoice_to_country%' which includes the order number as well as the customer address
+- `VOUCHER_ADDT_CANCELATION`: 'Cancelation '
+- `VOUCHER_ADDT_REFERENCE`: 'Reference: %refers%' which includes the reference document number
 
 Thus, the default voucher text for a cancellation (which refers to the cancelled invoice) would be for example: 
 

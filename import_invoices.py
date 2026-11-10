@@ -11,15 +11,7 @@ All vouchers will be creating using the same posting category which is specified
 
 Setup & Use
 -----------
-The script relies on the following environment variables to be set:
--   PRETIX_RESOURCE_URL: The base URL of the pretix API (e.g https://pretix.pony-events.eu/api/v1/organizers/[org]/events/[event])
--   PRETIX_API_KEY: The API key for the pretix API.
--   LEXWARE_API_URL: The base URL of the Lexware API (e.g. https://api.lexware.io/v1).
--   LEXWARE_API_KEY: The API key for the Lexware API.
--   VOUCHER_TEXT: The voucher remark; elements of the invoice object (see pretix API) fields can be inserted
-    as placeholders, e.g. %order%.
--   VOUCHER_ADDT_CANCELATION: Text added to cancellation vouchers; supports the same placeholders.
--   VOUCHER_ADDT_REFERENCE: Text added to vouchers with a reference; supports the same placeholders.
+Settings are read from settings.yaml; only PRETIX_API_KEY and LEXWARE_API_KEY are read from environment variables.
 
 The Lexware API URL remains static, the pretix API URL is event-specific and must be set accordingly. 
 You will need to run this script multiple times for each event if you want to handle multiple events.
@@ -81,17 +73,15 @@ import datetime
 import time
 import argparse
 import logging
+from pathlib import Path
 from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
+import yaml
 from rich.console import Console
 from rich.progress import Progress
 from rich.panel import Panel
 from rich.table import Table
 from rich.columns import Columns
-
-# Posting category ID for sales invoices in Lexware (sale of goods/services).
-# Adjust this id if necessary, list can be retrieved via the posting-categories endpoint of the Lexware API.
-PSTNG_CATEGORY_ID_SALES = '8f8664a8-fd86-11e1-a21f-0800200c9a66'
 
 CONSOLE = Console()
 LOGGER = LOGGER = logging.getLogger(__name__)
@@ -102,6 +92,8 @@ LOGFILE_NAME = 'pretix_to_lexware.log'
 
 load_dotenv()
 
+SETTINGS = {}
+
 def main():
     """Main function to handle the invoice import. 
 
@@ -109,6 +101,7 @@ def main():
     -d, --date DATE        Date for which to import invoices (format: YYYY-MM-DD). Defaults to yesterday if not provided.
     -t, --test             Run in test mode without actually creating invoices.
     -l, --logging          Create a log file in the same directory. 
+    -s, --settings-file    Path to the settings file if different from the default location (default: ./settings.yaml).
     """
 
     # Set up and retrieve command line arguments.
@@ -118,7 +111,13 @@ def main():
                         help='Date for which to import invoices (format: YYYY-MM-DD). Defaults to yesterday if not provided.')
     parser.add_argument('-t', '--test', action='store_true', help='Run in test mode without actually creating invoices.')
     parser.add_argument('-l', '--logging', action='store_true', help='Output log to a file in the same directory.')
+    parser.add_argument('-s', '--settings-file', default='./settings.yaml',
+                        help='Path to the settings file if different from the default location (default: ./settings.yaml).')
     args = parser.parse_args()
+
+    global SETTINGS
+    with Path(args.settings_file).open(encoding='utf-8') as settings_file:
+        SETTINGS = yaml.safe_load(settings_file)
 
     if args.date:
         global IMPORT_DATE
@@ -267,11 +266,11 @@ def main():
             voucher = vouchers.pop(0)  # Get the next voucher to import
 
             # The Lexware API has a rate limit of 2 requests per second. If the limit is exceeded, the API returns a 429 status code.
-            # We will retry the request in that case, up to a maximum number of attempts defined in the environment variable 
+            # We will retry the request up to the configured maximum in settings.yaml.
             # LEXWARE_RETRY_COUNT, and wait 2 seconds.
             attempts = 0
 
-            while (attempts <= int(os.environ.get('LEXWARE_RETRY_COUNT'))):  # type: ignore
+            while attempts <= SETTINGS['api_settings']['lexware']['retry_count']:
 
                 attempts += 1
 
@@ -295,7 +294,7 @@ def main():
                 elif result.status_code == 429:
                     # Rate limit exceeded, wait and try again 
                     time.sleep(2)
-                    message = f'API rate limit exceeded (status {result.status_code}). Will try again {int(os.environ.get("LEXWARE_RETRY_COUNT")) - attempts} more time(s).' # type: ignore
+                    message = f'API rate limit exceeded (status {result.status_code}). Will try again {SETTINGS["api_settings"]["lexware"]["retry_count"] - attempts} more time(s).'
                     CONSOLE.log(message, style='bold yellow') 
                     log(message, logging.WARNING) 
                     continue
@@ -326,7 +325,7 @@ def get_transactions(date: datetime.date):
     date -- the date for which to fetch transactions
     """
 
-    url = os.environ.get('PRETIX_RESOURCE_URL') + '/transactions/?created_since=' + date.strftime('%Y-%m-%d') + 'T00:00:00Z' # type: ignore
+    url = SETTINGS['api_settings']['pretix']['resource_url'] + '/transactions/?created_since=' + date.strftime('%Y-%m-%d') + 'T00:00:00Z'
     headers = {'Authorization': 'Token ' + os.environ.get('PRETIX_API_KEY')} # type: ignore
 
     response = requests.request('GET', url, headers=headers, data={})
@@ -347,7 +346,7 @@ def get_invoices(order: str):
     order -- the order for which to fetch invoices
     """
 
-    url = os.environ.get('PRETIX_RESOURCE_URL') + '/invoices/?order=' + order # type: ignore
+    url = SETTINGS['api_settings']['pretix']['resource_url'] + '/invoices/?order=' + order
     headers = {'Authorization': 'Token ' + os.environ.get('PRETIX_API_KEY')} # type: ignore
 
     response = requests.request('GET', url, headers=headers, data={})
@@ -361,7 +360,7 @@ def get_order(order: str):
     order -- the order to fetch
     """
 
-    url = os.environ.get('PRETIX_RESOURCE_URL') + '/orders/' + order # type: ignore
+    url = SETTINGS['api_settings']['pretix']['resource_url'] + '/orders/' + order
     headers = {'Authorization': 'Token ' + os.environ.get('PRETIX_API_KEY')} # type: ignore
 
     response = requests.request('GET', url, headers=headers, data={})
@@ -383,12 +382,12 @@ def create_giftcard_voucher(order, payment):
         'totalTaxAmount': 0.0,
         'taxType': 'gross',
         'useCollectiveContact': True,
-        'remark': replace_placeholders(os.environ.get('VOUCHER_TEXT_GIFTCARD', ''), order),
+        'remark': replace_placeholders(SETTINGS['texts']['giftcard'], order),
         'voucherItems': [{
             'amount': amount,
             'taxAmount': 0.0,
             'taxRatePercent': 0,
-            'categoryId': PSTNG_CATEGORY_ID_SALES,
+            'categoryId': SETTINGS['lexware']['posting_category'],
         }]
     }
 
@@ -426,23 +425,20 @@ def convert_invoice(invoice):
             'amount': gross_amount,
             'taxAmount': tax_amount,
             'taxRatePercent': int(round(float(item['tax_rate']), 0)),
-            'categoryId': PSTNG_CATEGORY_ID_SALES,
+            'categoryId': SETTINGS['lexware']['posting_category'],
         })
 
     voucher_text = replace_placeholders(
-        os.environ.get(
-            'VOUCHER_TEXT',
-            'Order %order% for event %event%,\n %invoice_to_name%, %invoice_to_street%, %invoice_to_zipcode% %invoice_to_city%, %invoice_to_country%',
-        ), invoice 
+        SETTINGS['texts']['voucher'], invoice
         )
 
     cancellation_prefix = (
-        replace_placeholders(os.environ.get('VOUCHER_ADDT_CANCELATION', 'Cancelation '), invoice)
+        replace_placeholders(SETTINGS['texts']['cancellation'], invoice)
         if invoice['is_cancellation'] == True else ''
     )
 
     reference = (
-        replace_placeholders(os.environ.get( 'VOUCHER_ADDT_REFERENCE', 'Reference: %refers%'), invoice)
+        replace_placeholders(SETTINGS['texts']['reference'], invoice)
         if invoice['refers'] is not None else ''
     )
 
@@ -473,7 +469,7 @@ def create_voucher(voucher):
         'Content-Type': 'application/json'
         }
 
-    response = requests.request('POST', os.environ.get('LEXWARE_API_URL') + '/vouchers', headers=headers, data=voucher)  # type: ignore
+    response = requests.request('POST', SETTINGS['api_settings']['lexware']['api_url'] + '/vouchers', headers=headers, data=voucher)
 
     return response
 
