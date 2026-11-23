@@ -136,469 +136,461 @@ class Settings:
     def set_logging(self, enabled: bool):
         self.logging_enabled = enabled
 
-CONSOLE = Console()
-LOGGER = LOGGER = logging.getLogger(__name__)
-IMPORT_DATE = datetime.date.today() - datetime.timedelta(days=1)
-SETTINGS: Settings
+class Connector:
+    def __init__(
+        self,
+        import_date: datetime.date,
+        test_mode: bool,
+        logging_enabled: bool,
+        settings_location: str,
+    ):
+        self.console = Console()
+        self.logger = logging.getLogger(__name__)
+        self.import_date = import_date
+        self.transactions: list[dict] = []
+        self.orders: list[str] = []
+        self.invoices: list[dict] = []
+        self.vouchers: list[dict] = []
+        self.import_successful: int = 0
+        self.import_failed: int = 0
 
-def main():
-    """Main function to handle the invoice import. 
+        with Path(settings_location).open(encoding='utf-8') as settings_file:
+            self.settings = Settings(yaml.safe_load(settings_file))
+        self.settings.set_logging(logging_enabled)
+        self.settings.set_test_mode(test_mode)
 
-    Console arguments (via argparse):
-    -d, --date DATE        Date for which to import invoices (format: YYYY-MM-DD). Defaults to yesterday if not provided.
-    -t, --test             Run in test mode without actually creating invoices.
-    -l, --logging          Create a log file in the same directory. 
-    -s, --settings-file    Path to the settings file if different from the default location (default: ./settings.yaml).
-    """
-
-    message = '' # Message variable for logging and console output. 
-
-    # Set up and retrieve command line arguments.
-    parser = argparse.ArgumentParser(description='Import invoices from pretix to Lexware for a specified date.')
-    parser.add_argument('-d', '--date', 
-                        type=lambda s: datetime.datetime.strptime(s, '%Y-%m-%d'), 
-                        help='Date for which to import invoices (format: YYYY-MM-DD). Defaults to yesterday if not provided.')
-    parser.add_argument('-t', '--test', action='store_true', help='Run in test mode without actually creating invoices.')
-    parser.add_argument('-l', '--logging', action='store_true', help='Output log to a file in the same directory.')
-    parser.add_argument('-s', '--settings-file', default='./settings.yaml',
-                        help='Path to the settings file if different from the default location (default: ./settings.yaml).')
-    args = parser.parse_args()
-
-    # Try to open the settings file, either the default or the one specified via command line argument, and parse the content.
-    # If the file is not found or cannot be parsed, log an error and exit.
-    try:
-        global SETTINGS
-        with Path(args.settings_file).open(encoding='utf-8') as settings_file:
-            SETTINGS = Settings(yaml.safe_load(settings_file))
-    except FileNotFoundError:
-        message = f"Settings file not found under {args.settings_file}. Please ensure the settings file exists and is accessible."
-        CONSOLE.log(message, style='bold red')
-        log(message, logging.ERROR)
-        return
-    except yaml.YAMLError as e:
-        message = f"Error parsing the settings file: {e}. Please ensure the settings file is valid YAML."
-        CONSOLE.log(message, style='bold red')
-        log(message, logging.ERROR)
-        return
-    except KeyError as e:
-        message = f"{e}"
-        CONSOLE.log(message, style='bold red')
-        log(message, logging.ERROR)
-        return
-
-    # Check if all required settings (which are not overwritten by default values) are present in the settings file. 
-    # If any are missing, log an error and exit.
-    if not SETTINGS.pretix.resource_url or not SETTINGS.pretix.api_token:
-        message = "Pretix API settings are missing or incomplete in the settings file. Please provide the resource URL and API token."
-        CONSOLE.log(message, style='bold red')
-        log(message, logging.ERROR)
-        return
-
-    if not SETTINGS.lexware.api_url or not SETTINGS.lexware.api_key or not SETTINGS.lexware.posting_category or not SETTINGS.lexware.retry_count:
-        message = "Lexware API settings are missing or incomplete in the settings file. Please provide the API URL and API key."
-        CONSOLE.log(message, style='bold red')
-        log(message, logging.ERROR)
-        return
-
-    # Try to parse the date and check if it in the past. If the date is invalid or in the future, log an error and exit.
-    if args.date:
-        try: 
-            global IMPORT_DATE
-            IMPORT_DATE = args.date.date() 
-        except ValueError:
-            message = f"Invalid date format: {args.date}. Please use YYYY-MM-DD."
-            CONSOLE.log(message, style='bold red')
-            log(message, logging.ERROR)
-            return
-        except Exception as e:
-            message = f"An unexpected error occurred while processing the date: {e}"
-            CONSOLE.log(message, style='bold red')
-            log(message, logging.ERROR)
-            return
-        if datetime.date.today() < IMPORT_DATE:
-            message = f"Specified date {IMPORT_DATE} is today or in the future. Please specify a past date."
-            CONSOLE.log(message, style='bold red')
-            log(message, logging.ERROR)
+    def out(self, message, style=None, level=logging.INFO):
+        self.console.log(message, style=style)
+        if not self.settings.logging_enabled:
             return
 
-    # Activate logging and/or test mode if requested. 
-    if args.test:
-        global SETTINGS
-        SETTINGS.set_test_mode(args.test)
+        match level:
+            case logging.DEBUG:
+                self.logger.debug(message)
+            case logging.INFO:
+                self.logger.info(message)
+            case logging.WARNING:
+                self.logger.warning(message)
+            case logging.ERROR:
+                self.logger.error(message)
 
-    if args.logging:
-        global SETTINGS
-        SETTINGS.set_logging(args.logging)
+    def configure_logging(self):
+        if not self.settings.logging_enabled:
+            return
 
-    # Set up logging to file if requested. 
-    if SETTINGS.logging_enabled:
-        LOGGER.setLevel(logging.DEBUG)
+        self.logger.setLevel(logging.DEBUG)
+        file_handler = RotatingFileHandler(
+            self.settings.logfile_name, maxBytes=1024 * 1024, backupCount=5
+        )
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(
+            logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        )
+        self.logger.addHandler(file_handler)
+
+    def run(self):
+        if not self.settings.pretix.resource_url or not self.settings.pretix.api_token:
+            self.out(
+                'Pretix API settings are missing or incomplete in the settings file. '
+                'Please provide the resource URL and API token.',
+                style='bold red',
+                level=logging.ERROR,
+            )
+            return
+
+        if (
+            not self.settings.lexware.api_url
+            or not self.settings.lexware.api_key
+            or not self.settings.lexware.posting_category
+            or not self.settings.lexware.retry_count
+        ):
+            self.out(
+                'Lexware API settings are missing or incomplete in the settings file. '
+                'Please provide the API URL and API key.',
+                style='bold red',
+                level=logging.ERROR,
+            )
+            return
+
+        if self.import_date >= datetime.date.today():
+            self.out(
+                f'Specified date {self.import_date} is today or in the future. '
+                'Please specify a past date.',
+                style='bold red',
+                level=logging.ERROR,
+            )
+            return
 
         try:
-            file_handler = RotatingFileHandler(SETTINGS.logfile_name, maxBytes=1024*1024, backupCount=5)
-        except Exception as e:
-            message = f"Failed to set up logging to file: {e}. Please check file permissions and available disk space."
-            CONSOLE.log(message, style='bold red')
-            log(message, logging.ERROR)
+            self.configure_logging()
+        except OSError as error:
+            self.out(
+                f'Failed to set up logging to file: {error}. '
+                'Please check file permissions and available disk space.',
+                style='bold red',
+                level=logging.ERROR,
+            )
             return
-        file_handler.setLevel(logging.DEBUG)
 
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(formatter)
+        if self.settings.test_mode:
+            message = 'Running in test mode. No invoices will be created.'
+            self.console.print(Panel(message, title='TEST MODE', style='bold yellow'))
+            self.out(message, style='bold yellow', level=logging.WARNING)
 
-        LOGGER.addHandler(file_handler)
+        with self.console.status(f'Fetching transactions for {self.import_date}...'):
+            self.transactions = self.get_transactions(self.import_date)
 
-    if SETTINGS.test_mode:
-        message = 'Running in test mode. No invoices will be created.'
-        CONSOLE.print(Panel(message, title='TEST MODE', style='bold yellow'))
-        log(message, logging.WARNING)
+        if not self.transactions:
+            self.out(
+                f'No transactions received for {self.import_date}. Leaving program.',
+                style='bold yellow',
+            )
+            return
 
-    # Get transactions for the specified date from pretix. The invoice endpoint has no date filter, 
-    # but a filter for order numbers. Therefore, we first fetch all transactions for the specified date, 
-    # filter out unique order numbers and then fetch all invoices for those orders. The list of invoices 
-    # is then filtered by the specified date to get only the relevant invoices created on that date.
-    with CONSOLE.status(f'Fetching transactions for {IMPORT_DATE}...'):
-        transactions = get_transactions(IMPORT_DATE)
+        self.orders = list(dict.fromkeys(
+            transaction['order'] for transaction in self.transactions
+        ))
+        self.fetch_invoices()
 
-    # If no transactions are found, leave the program.
-    if len(transactions) == 0:
-        message = f'No transactions received for {IMPORT_DATE}. Leaving program.'
-        CONSOLE.log(message, style='bold yellow')
-        log(message, logging.INFO)
-        return
+        if not self.invoices:
+            self.out(
+                f'No invoices to import for {self.import_date}. Leaving program.',
+                style='bold yellow',
+            )
+            return
 
-    # There can be more than one transaction per order on a single day, so we need to filter out duplicates.
-    # The unique list of orders is necessary to fetch the invoices for each order. 
-    relevant_orders_unique = set()
+        self.convert_invoices()
+        self.add_giftcard_vouchers()
+        self.post_vouchers()
 
-    for transaction in transactions:
-        relevant_orders_unique.add(transaction['order'])
+    def get_transactions(self, date: datetime.date):
+        """Fetch transactions from pretix for a given date."""
+        url = (
+            self.settings.pretix.resource_url
+            + '/transactions/?created_since='
+            + date.strftime('%Y-%m-%d')
+            + 'T00:00:00Z'
+        )
+        headers = {'Authorization': 'Token ' + self.settings.pretix.api_token}
+        response = requests.request('GET', url, headers=headers, data={})
 
-    relevant_orders = list(relevant_orders_unique)
+        if response.status_code != 200:
+            self.out(
+                f'Failed to fetch transactions: {response.status_code} - {response.text}',
+                style='bold red',
+                level=logging.ERROR,
+            )
+            return []
 
-    # Fetch invoices for each order and filter by the specified date.
-    with Progress(expand=True) as prg_get_invoices:
-        message = f'Fetching invoices for {len(relevant_orders)} orders...'
-        task_get_invoice = prg_get_invoices.add_task(message, total=len(relevant_orders))
-        log(message, logging.INFO)
-        
-        invoices_to_import = []
+        result = response.json()
+        self.out(
+            f'Successfully fetched {result["count"]} transactions for {date}',
+            style='bold green',
+        )
+        return result['results']
 
-        tbl_fetched_invoices = Table(title='Fetched Invoices')
-        tbl_fetched_invoices.add_column('Invoice Number', style='cyan', no_wrap=True)
-        tbl_fetched_invoices.add_column('Order', no_wrap=True)
-        tbl_fetched_invoices.add_column('Invoice Date', no_wrap=True)
-        tbl_fetched_invoices.add_column('Status', no_wrap=True)
+    def get_invoices(self, order: str):
+        """Fetch invoices from pretix for a given order."""
+        url = self.settings.pretix.resource_url + '/invoices/?order=' + order
+        headers = {'Authorization': 'Token ' + self.settings.pretix.api_token}
+        response = requests.request('GET', url, headers=headers, data={})
+        return response.json()['results']
 
-        while not prg_get_invoices.finished:
-            order = relevant_orders.pop(0)
-            invoices = get_invoices(order)
-            for invoice in invoices:
-                if invoice['date'] == IMPORT_DATE.strftime('%Y-%m-%d'):
-                    invoices_to_import.append(invoice)
-                    tbl_fetched_invoices.add_row(invoice['number'], order, IMPORT_DATE.strftime('%Y-%m-%d'), '[bold green]to be imported')
-                    log(f'Invoice {invoice["number"]} for order {order} noted for import', logging.INFO)
-                else: 
-                    tbl_fetched_invoices.add_row(invoice['number'], order, IMPORT_DATE.strftime('%Y-%m-%d'), '[bold yellow]no import')
-                    log(f'Invoice {invoice["number"]} for order {order} created on {invoice["date"]}, no import', logging.INFO)
+    def get_order(self, order: str):
+        """Fetch an order from pretix."""
+        url = self.settings.pretix.resource_url + '/orders/' + order
+        headers = {'Authorization': 'Token ' + self.settings.pretix.api_token}
+        response = requests.request('GET', url, headers=headers, data={})
+        return response.json()
 
-            prg_get_invoices.update(task_get_invoice, advance=1)
+    def fetch_invoices(self):
+        with Progress(expand=True) as progress:
+            message = f'Fetching invoices for {len(self.orders)} orders...'
+            task = progress.add_task(message, total=len(self.orders))
+            self.out(message)
 
-    CONSOLE.print(tbl_fetched_invoices)
+            table = Table(title='Fetched Invoices')
+            table.add_column('Invoice Number', style='cyan', no_wrap=True)
+            table.add_column('Order', no_wrap=True)
+            table.add_column('Invoice Date', no_wrap=True)
+            table.add_column('Status', no_wrap=True)
 
-    # Leave program if there are no invoices to import. 
-    if len(invoices_to_import) == 0:
-        message = f'No invoices to import for {IMPORT_DATE}. Leaving program.'
-        CONSOLE.log(message, style='bold yellow')
-        log(message, logging.INFO)
-        return
-
-    # Convert invoices to voucher objects for the Lexware API. 
-    vouchers = []
-
-    with Progress(expand=True) as prg_convert_invoices:
-        message = f'Converting {len(invoices_to_import)} invoices to vouchers...'
-        task_convert_invoice = prg_convert_invoices.add_task(message, total=len(invoices_to_import))
-        log(message, logging.INFO)
-
-        while not prg_convert_invoices.finished:
-            invoice = invoices_to_import.pop(0)  # Get the next invoice to convert
-            vouchers.append(json.loads(convert_invoice(invoice)))  # Convert the invoice to a voucher object
-            prg_convert_invoices.update(task_convert_invoice, advance=1)
-
-    # Chech the order for used gift cards and create additional vouchers to reverse the purchase. 
-    relevant_orders = list(relevant_orders_unique)
-
-    with Progress(expand=True) as prg_giftcards:
-        message = f'Checking {len(relevant_orders)} orders for used gift cards...'
-        task_giftcard_check = prg_giftcards.add_task(message, total=len(relevant_orders))
-        log(message, logging.INFO)
-
-        while not prg_giftcards.finished:
-            order = relevant_orders.pop(0)
-            order_details = get_order(order)
-            for payment in order_details.get('payments', []):
-                # If a gift card was used, there is an entry in the payments array with the provider "giftcard". 
-                if payment.get('provider') != 'giftcard':
-                    continue
-                # Make sure the gift card has been applied on the correct (import) date. 
-                payment_date = payment.get('payment_date')
-                if payment_date and datetime.datetime.fromisoformat(payment_date).date() == IMPORT_DATE:
-                    vouchers.append(create_giftcard_voucher(order_details, payment))
-                    log(
-                        f'Gift card payment {payment["local_id"]} for order {order} noted for reversal.',
-                        logging.INFO,
+            for order in self.orders:
+                for invoice in self.get_invoices(order):
+                    if invoice['date'] == self.import_date.strftime('%Y-%m-%d'):
+                        self.invoices.append(invoice)
+                        status = '[bold green]to be imported'
+                        self.out(
+                            f'Invoice {invoice["number"]} for order {order} noted for import'
+                        )
+                    else:
+                        status = '[bold yellow]no import'
+                        self.out(
+                            f'Invoice {invoice["number"]} for order {order} created '
+                            f'on {invoice["date"]}, no import'
+                        )
+                    table.add_row(
+                        invoice['number'],
+                        order,
+                        invoice['date'],
+                        status,
                     )
-            prg_giftcards.update(task_giftcard_check, advance=1)
+                progress.update(task, advance=1)
 
-    total_invoices = len(vouchers)
-    import_failed = 0
-    import_successful = 0
+        self.console.print(table)
 
-    tbl_imp_invoices = Table(title='Imported Invoices')
-    tbl_imp_invoices.add_column('Invoice Number', style='cyan', no_wrap=True)
-    tbl_imp_invoices.add_column('Type', no_wrap=True)
-    tbl_imp_invoices.add_column('Invoice Date', no_wrap=True)
-    tbl_imp_invoices.add_column('Gross Amount', no_wrap=True, justify='right')
-    tbl_imp_invoices.add_column('Tax Amount', no_wrap=True, justify='right')
-    tbl_imp_invoices.add_column('Status', no_wrap=True)
+    def replace_placeholders(self, text: str, data: dict):
+        """Replace placeholders that match keys in a pretix object."""
+        for key, value in data.items():
+            text = text.replace(f'%{key}%', str(value))
+        return text
 
-    # Post the vouchers to the Lexware API. 
-    with Progress(expand=True) as prg_post_invoices:
-        message = f'Importing {total_invoices} invoices...'
-        task_post_invoice = prg_post_invoices.add_task(message, total=total_invoices)
-        log(message, logging.INFO)
+    def convert_invoice(self, invoice: dict):
+        """Convert a pretix invoice to a Lexware voucher."""
+        items = []
+        total_gross = 0.0
+        total_tax = 0.0
 
-        while not prg_post_invoices.finished:
-            voucher = vouchers.pop(0)  # Get the next voucher to import
+        for item in invoice['lines']:
+            tax_amount = round(float(item['tax_value'].replace('-', '')), 2)
+            gross_amount = round(float(item['gross_value'].replace('-', '')), 2)
+            total_gross += gross_amount
+            total_tax += tax_amount
+            items.append({
+                'amount': gross_amount,
+                'taxAmount': tax_amount,
+                'taxRatePercent': int(round(float(item['tax_rate']), 0)),
+                'categoryId': self.settings.lexware.posting_category,
+            })
 
-            # The Lexware API has a rate limit of 2 requests per second. If the limit is exceeded, the API returns a 429 status code.
-            # We will retry the request up to the configured maximum in settings.yaml.
-            # LEXWARE_RETRY_COUNT, and wait 2 seconds.
-            attempts = 0
-
-            while attempts <= SETTINGS.lexware.retry_count:
-
-                attempts += 1
-
-                # In test mode, the Lexware API will not be called.
-                if SETTINGS.test_mode: 
-                    tbl_imp_invoices.add_row(voucher['voucherNumber'], voucher['type'], IMPORT_DATE.strftime('%Y-%m-%d'), f'{voucher["totalGrossAmount"]:.2f}', f'{voucher["totalTaxAmount"]:.2f}', '[bold green]no import (test mode)')
-                    import_successful += 1
-                    prg_post_invoices.update(task_post_invoice, advance=1)
-                    log(f'Invoice {voucher["voucherNumber"]} not imported (test mode).', logging.INFO)
-                    break
-
-                result = create_voucher(json.dumps(voucher))
-
-                if result.ok: 
-                    # Document has been created, exit loop.
-                    tbl_imp_invoices.add_row(voucher['voucherNumber'], voucher['type'], IMPORT_DATE.strftime('%Y-%m-%d'), f'{voucher["totalGrossAmount"]:.2f}', f'{voucher["totalTaxAmount"]:.2f}', '[bold green]successful')
-                    log(f'Invoice {voucher["voucherNumber"]} imported successfully.', logging.INFO)
-                    import_successful += 1
-                    prg_post_invoices.update(task_post_invoice, advance=1)
-                    break
-                elif result.status_code == 429:
-                    # Rate limit exceeded, wait and try again 
-                    time.sleep(2)
-                    message = f'API rate limit exceeded (status {result.status_code}). Will try again {SETTINGS.lexware.retry_count - attempts} more time(s).'
-                    CONSOLE.log(message, style='bold yellow') 
-                    log(message, logging.WARNING) 
-                    continue
-                else: 
-                    # Document creation failed for a different reason, exit loop.
-                    tbl_imp_invoices.add_row(voucher['voucherNumber'], voucher['type'], IMPORT_DATE.strftime('%Y-%m-%d'), f'{voucher["totalGrossAmount"]:.2f}', f'{voucher["totalTaxAmount"]:.2f}', '[bold red]failed')
-                    log(f'Failed to import invoice {voucher["voucherNumber"]}: {result.status_code} {result.text}', logging.ERROR)
-                    import_failed += 1
-                    prg_post_invoices.update(task_post_invoice, advance=1)
-                    break
-
-    CONSOLE.print(tbl_imp_invoices)
-
-    CONSOLE.log(f'Import summary for {IMPORT_DATE}:', style='bold')
-
-    stats = [   Panel(f'{import_successful}', title='Successful', style='bold green'),
-                Panel(f'{import_failed}', title='Failed', style='bold red'),
-                Panel(f'{total_invoices}', title='Total', style='bold')]
-
-    CONSOLE.log(Columns(stats))
-
-    log(f'Import summary for {IMPORT_DATE}: {import_successful} successful, {import_failed} failed out of {total_invoices} total.', logging.INFO)
-
-def get_transactions(date: datetime.date):
-    """Fetches transactions from the pretix API for a given date.
-
-    Keyword arguments:
-    date -- the date for which to fetch transactions
-    """
-
-    url = SETTINGS.pretix.resource_url + '/transactions/?created_since=' + date.strftime('%Y-%m-%d') + 'T00:00:00Z'
-    headers = {'Authorization': 'Token ' + SETTINGS.pretix.api_token}
-
-    response = requests.request('GET', url, headers=headers, data={})
-
-    if response.status_code != 200:
-        CONSOLE.log(f'[bold red]Failed to fetch transactions: {response.status_code} - {response.text}')
-        log(f'[bold red]Failed to fetch transactions: {response.status_code} - {response.text}', logging.ERROR)
-        return []
-    else:
-        CONSOLE.log(f'[bold green]Successfully fetched {json.loads(response.text)["count"]} transactions for {date}')
-        log(f'[bold green]Successfully fetched {json.loads(response.text)["count"]} transactions for {date}', logging.INFO)
-        return(json.loads(response.text)['results'])
-
-def get_invoices(order: str):
-    """Fetches invoices from the pretix API for a given order.
-
-    Keyword arguments:
-    order -- the order for which to fetch invoices
-    """
-
-    url = SETTINGS.pretix.resource_url + '/invoices/?order=' + order
-    headers = {'Authorization': 'Token ' + SETTINGS.pretix.api_token}
-
-    response = requests.request('GET', url, headers=headers, data={})
-
-    return(json.loads(response.text)['results'])
-
-def get_order(order: str):
-    """Fetches an order from the pretix API.
-
-    Keyword arguments:
-    order -- the order to fetch
-    """
-
-    url = SETTINGS.pretix.resource_url + '/orders/' + order
-    headers = {'Authorization': 'Token ' + SETTINGS.pretix.api_token}
-
-    response = requests.request('GET', url, headers=headers, data={})
-
-    return(json.loads(response.text))
-
-def create_giftcard_voucher(order, payment):
-    """Create a voucher to reverse a gift card purchase.
-    
-    Keyword arguments:
-    order   -- the pretix order (JSON object), see API documentation for details
-    payment -- the pretix payment (JSON object), see API documentation for details
-    """
-
-    amount = round(float(payment['amount'].replace('-', '')), 2)
-
-    return {
-        'type': 'salescreditnote',
-        'voucherNumber': f'GIFT-{order["code"]}-{payment["local_id"]:03d}',
-        'voucherDate': IMPORT_DATE.strftime('%Y-%m-%d'),
-        'shippingDate': IMPORT_DATE.strftime('%Y-%m-%d'),
-        'dueDate': IMPORT_DATE.strftime('%Y-%m-%d'),
-        'totalGrossAmount': amount,
-        'totalTaxAmount': 0.0,
-        'taxType': 'gross',
-        'useCollectiveContact': True,
-        'remark': replace_placeholders(SETTINGS.texts.giftcard, order),
-        'voucherItems': [{
-            'amount': amount,
-            'taxAmount': 0.0,
-            'taxRatePercent': 0,
-            'categoryId': SETTINGS.lexware.posting_category,
-        }]
-    }
-
-def replace_placeholders(text, invoice):
-    """Replace placeholders matching invoice keys, such as %order%, in text.
-    
-    Keyword arguments:
-    text    -- the text with placeholders from the .env file 
-    invoice -- the pretix invoice to convert (JSON object), see API documentation for details on the JSON structure    
-    """
-    for key, value in invoice.items():
-        text = text.replace(f'%{key}%', str(value))
-    return text
-
-def convert_invoice(invoice):
-    """Converts a pretix invoice to the format required by the Lexware API.
-
-    Keyword arguments:
-    invoice -- the pretix invoice to convert (JSON object), see API documentation for details on the JSON structure
-    """
-
-    items = []
-    total_gross = 0.0
-    total_tax = 0.0
-    
-    for item in invoice['lines']:
-
-        tax_amount = round(float(item['tax_value'].replace('-', '')), 2)  # Remove negative sign if present
-        gross_amount = round(float(item['gross_value'].replace('-', '')), 2)  # Remove negative sign if present
-
-        total_gross += gross_amount
-        total_tax += tax_amount
-
-        items.append({
-            'amount': gross_amount,
-            'taxAmount': tax_amount,
-            'taxRatePercent': int(round(float(item['tax_rate']), 0)),
-            'categoryId': SETTINGS.lexware.posting_category,
-        })
-
-    voucher_text = replace_placeholders(
-        SETTINGS.texts.voucher, invoice
+        voucher_text = self.replace_placeholders(self.settings.texts.voucher, invoice)
+        cancellation_prefix = (
+            self.replace_placeholders(self.settings.texts.cancellation, invoice)
+            if invoice['is_cancellation']
+            else ''
+        )
+        reference = (
+            self.replace_placeholders(self.settings.texts.reference, invoice)
+            if invoice['refers'] is not None
+            else ''
         )
 
-    cancellation_prefix = (
-        replace_placeholders(SETTINGS.texts.cancellation, invoice)
-        if invoice['is_cancellation'] == True else ''
-    )
-
-    reference = (
-        replace_placeholders(SETTINGS.texts.reference, invoice)
-        if invoice['refers'] is not None else ''
-    )
-
-    return json.dumps({
-        'type': 'salesinvoice' if invoice['is_cancellation'] == False else 'salescreditnote',
-        'voucherNumber': invoice['number'],
-        'voucherDate': invoice['date'],
-        'shippingDate': invoice['date'],
-        'dueDate': invoice['date'],     
-        'totalGrossAmount': round(total_gross, 2),
-        'totalTaxAmount': round(total_tax, 2),
-        'taxType': 'gross',
-        'useCollectiveContact': True,
-        'remark': f'{cancellation_prefix}{voucher_text}{reference}',
-        'voucherItems': items
-    })
-
-def create_voucher(voucher):
-    """Creates a voucher in the Lexware API.
-
-    Keyword arguments:
-    voucher -- the voucher data to create (JSON object), see Lexware API documentation for details on the JSON structure
-    """
-
-    headers = {
-        'Authorization': 'Bearer ' + SETTINGS.lexware.api_key,
-        'Accept': 'application/json',
-        'Content-Type': 'application/json'
+        return {
+            'type': 'salescreditnote' if invoice['is_cancellation'] else 'salesinvoice',
+            'voucherNumber': invoice['number'],
+            'voucherDate': invoice['date'],
+            'shippingDate': invoice['date'],
+            'dueDate': invoice['date'],
+            'totalGrossAmount': round(total_gross, 2),
+            'totalTaxAmount': round(total_tax, 2),
+            'taxType': 'gross',
+            'useCollectiveContact': True,
+            'remark': f'{cancellation_prefix}{voucher_text}{reference}',
+            'voucherItems': items,
         }
 
-    response = requests.request('POST', SETTINGS.lexware.api_url + '/vouchers', headers=headers, data=voucher)
+    def convert_invoices(self):
+        message = f'Converting {len(self.invoices)} invoices to vouchers...'
+        self.out(message, level=logging.INFO)
+        with Progress(expand=True) as progress:
+            task = progress.add_task(message, total=len(self.invoices))
+            for invoice in self.invoices:
+                self.vouchers.append(self.convert_invoice(invoice))
+                progress.update(task, advance=1)
 
-    return response
+    def create_giftcard_voucher(self, order: dict, payment: dict):
+        """Create a voucher to reverse a gift card payment."""
+        amount = round(float(payment['amount'].replace('-', '')), 2)
+        voucher_date = self.import_date.strftime('%Y-%m-%d')
+        return {
+            'type': 'salescreditnote',
+            'voucherNumber': f'GIFT-{order["code"]}-{payment["local_id"]:03d}',
+            'voucherDate': voucher_date,
+            'shippingDate': voucher_date,
+            'dueDate': voucher_date,
+            'totalGrossAmount': amount,
+            'totalTaxAmount': 0.0,
+            'taxType': 'gross',
+            'useCollectiveContact': True,
+            'remark': self.replace_placeholders(self.settings.texts.giftcard, order),
+            'voucherItems': [{
+                'amount': amount,
+                'taxAmount': 0.0,
+                'taxRatePercent': 0,
+                'categoryId': self.settings.lexware.posting_category,
+            }],
+        }
 
-def log(message, level):
+    def add_giftcard_vouchers(self):
+        message = f'Checking {len(self.orders)} orders for used gift cards...'
+        self.out(message, level=logging.INFO)
+        with Progress(expand=True) as progress:
+            task = progress.add_task(message, total=len(self.orders))
+            for order in self.orders:
+                order_details = self.get_order(order)
+                for payment in order_details.get('payments', []):
+                    if payment.get('provider') != 'giftcard':
+                        continue
+                    payment_date = payment.get('payment_date')
+                    if (
+                        payment_date
+                        and datetime.datetime.fromisoformat(payment_date).date()
+                        == self.import_date
+                    ):
+                        self.vouchers.append(
+                            self.create_giftcard_voucher(order_details, payment)
+                        )
+                        self.out(
+                            f'Gift card payment {payment["local_id"]} for order '
+                            f'{order} noted for reversal.'
+                        )
+                progress.update(task, advance=1)
 
-    if not SETTINGS.logging_enabled:
+    def create_voucher(self, voucher: dict):
+        """Create a voucher in the Lexware API."""
+        headers = {
+            'Authorization': 'Bearer ' + self.settings.lexware.api_key,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+        }
+        return requests.request(
+            'POST',
+            self.settings.lexware.api_url + '/vouchers',
+            headers=headers,
+            data=json.dumps(voucher),
+        )
+
+    def post_vouchers(self):
+        total_vouchers = len(self.vouchers)
+        table = Table(title='Imported Invoices')
+        table.add_column('Invoice Number', style='cyan', no_wrap=True)
+        table.add_column('Type', no_wrap=True)
+        table.add_column('Invoice Date', no_wrap=True)
+        table.add_column('Gross Amount', no_wrap=True, justify='right')
+        table.add_column('Tax Amount', no_wrap=True, justify='right')
+        table.add_column('Status', no_wrap=True)
+
+        with Progress(expand=True) as progress:
+            message = f'Importing {total_vouchers} invoices...'
+            task = progress.add_task(message, total=total_vouchers)
+            self.out(message)
+
+            for voucher in self.vouchers:
+                status = '[bold red]failed'
+                if self.settings.test_mode:
+                    status = '[bold green]no import (test mode)'
+                    self.import_successful += 1
+                    self.out(
+                        f'Invoice {voucher["voucherNumber"]} not imported (test mode).'
+                    )
+                else:
+                    for attempt in range(self.settings.lexware.retry_count + 1):
+                        result = self.create_voucher(voucher)
+                        if result.ok:
+                            status = '[bold green]successful'
+                            self.import_successful += 1
+                            self.out(
+                                f'Invoice {voucher["voucherNumber"]} imported successfully.'
+                            )
+                            break
+                        if result.status_code == 429 and attempt < self.settings.lexware.retry_count:
+                            time.sleep(2)
+                            remaining = self.settings.lexware.retry_count - attempt
+                            message = (
+                                f'API rate limit exceeded (status {result.status_code}). '
+                                f'Will try again {remaining} more time(s).'
+                            )
+                            self.out(message, style='bold yellow', level=logging.WARNING)
+                            continue
+
+                        self.import_failed += 1
+                        self.out(
+                            f'Failed to import invoice {voucher["voucherNumber"]}: '
+                            f'{result.status_code} {result.text}',
+                            level=logging.ERROR,
+                        )
+                        break
+
+                table.add_row(
+                    voucher['voucherNumber'],
+                    voucher['type'],
+                    self.import_date.strftime('%Y-%m-%d'),
+                    f'{voucher["totalGrossAmount"]:.2f}',
+                    f'{voucher["totalTaxAmount"]:.2f}',
+                    status,
+                )
+                progress.update(task, advance=1)
+
+        self.console.print(table)
+        self.console.log(f'Import summary for {self.import_date}:', style='bold')
+        stats = [
+            Panel(f'{self.import_successful}', title='Successful', style='bold green'),
+            Panel(f'{self.import_failed}', title='Failed', style='bold red'),
+            Panel(f'{total_vouchers}', title='Total', style='bold'),
+        ]
+        self.console.log(Columns(stats))
+        self.out(
+            f'Import summary for {self.import_date}: {self.import_successful} '
+            f'successful, {self.import_failed} failed out of {total_vouchers} total.'
+        )
+
+
+def main():
+    """Parse command-line options and run the invoice import."""
+    parser = argparse.ArgumentParser(
+        description='Import invoices from pretix to Lexware for a specified date.'
+    )
+    parser.add_argument(
+        '-d',
+        '--date',
+        type=lambda value: datetime.datetime.strptime(value, '%Y-%m-%d').date(),
+        help='Date for which to import invoices (format: YYYY-MM-DD). Defaults to yesterday.',
+    )
+    parser.add_argument(
+        '-t', '--test', action='store_true',
+        help='Run in test mode without actually creating invoices.',
+    )
+    parser.add_argument(
+        '-l', '--logging', action='store_true',
+        help='Output log to a file in the same directory.',
+    )
+    parser.add_argument(
+        '-s', '--settings-file', default='./settings.yaml',
+        help='Path to the settings file if different from the default location (default: ./settings.yaml).',
+    )
+    args = parser.parse_args()
+    import_date = args.date or datetime.date.today() - datetime.timedelta(days=1)
+
+    try:
+        connector = Connector(
+            import_date,
+            args.test,
+            args.logging,
+            args.settings_file,
+        )
+    except FileNotFoundError:
+        Console().log(
+            f'Settings file not found under {args.settings_file}. '
+            'Please ensure the settings file exists and is accessible.',
+            style='bold red',
+        )
+        logging.getLogger(__name__).error('Settings file not found: %s', args.settings_file)
+        return
+    except yaml.YAMLError as error:
+        Console().log(
+            f'Error parsing the settings file: {error}. '
+            'Please ensure the settings file is valid YAML.',
+            style='bold red',
+        )
+        logging.getLogger(__name__).error('Error parsing settings file: %s', error)
+        return
+    except KeyError as error:
+        Console().log(str(error), style='bold red')
+        logging.getLogger(__name__).error('Missing required setting: %s', error)
         return
 
-    match level:
-        case logging.DEBUG:
-            LOGGER.debug(message)
-        case logging.INFO:
-            LOGGER.info(message)
-        case logging.WARNING:
-            LOGGER.warning(message)
-        case logging.ERROR:
-            LOGGER.error(message)
+    connector.run()
+
 
 if __name__ == '__main__':
     main()
