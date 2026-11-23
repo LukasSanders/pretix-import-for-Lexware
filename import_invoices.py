@@ -72,11 +72,19 @@ import datetime
 import time
 import argparse
 import logging
+from contextlib import contextmanager
+from collections.abc import Generator
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 import yaml
 from rich.console import Console
-from rich.progress import Progress
+from rich.progress import (
+    BarColumn,
+    Progress,
+    TaskProgressColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 from rich.panel import Panel
 from rich.table import Table
 from rich.columns import Columns
@@ -153,6 +161,7 @@ class Connector:
         self.vouchers: list[dict] = []
         self.import_successful: int = 0
         self.import_failed: int = 0
+        self._active_progress: Progress | None = None
 
         with Path(settings_location).open(encoding='utf-8') as settings_file:
             self.settings = Settings(yaml.safe_load(settings_file))
@@ -160,7 +169,12 @@ class Connector:
         self.settings.set_test_mode(test_mode)
 
     def out(self, message, style=None, level=logging.INFO):
-        self.console.log(message, style=style)
+        console = (
+            self._active_progress.console
+            if self._active_progress is not None
+            else self.console
+        )
+        console.log(message, style=style)
         if not self.settings.logging_enabled:
             return
 
@@ -173,6 +187,29 @@ class Connector:
                 self.logger.warning(message)
             case logging.ERROR:
                 self.logger.error(message)
+
+    @contextmanager
+    def progress(
+        self,
+        **kwargs,
+    ) -> Generator[Progress, None, None]:
+        """Run a progress indicator and route output through its console."""
+        progress = Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=None),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+            console=self.console,
+            expand=True,
+            refresh_per_second=10,
+            **kwargs,
+        )
+        self._active_progress = progress
+        try:
+            with progress as active_progress:
+                yield active_progress
+        finally:
+            self._active_progress = None
 
     def configure_logging(self):
         if not self.settings.logging_enabled:
@@ -304,7 +341,7 @@ class Connector:
         return response.json()
 
     def fetch_invoices(self):
-        with Progress(expand=True) as progress:
+        with self.progress() as progress:
             message = f'Fetching invoices for {len(self.orders)} orders...'
             task = progress.add_task(message, total=len(self.orders))
             self.out(message)
@@ -391,9 +428,9 @@ class Connector:
 
     def convert_invoices(self):
         message = f'Converting {len(self.invoices)} invoices to vouchers...'
-        self.out(message, level=logging.INFO)
-        with Progress(expand=True) as progress:
+        with self.progress() as progress:
             task = progress.add_task(message, total=len(self.invoices))
+            self.out(message, level=logging.INFO)
             for invoice in self.invoices:
                 self.vouchers.append(self.convert_invoice(invoice))
                 progress.update(task, advance=1)
@@ -423,9 +460,9 @@ class Connector:
 
     def add_giftcard_vouchers(self):
         message = f'Checking {len(self.orders)} orders for used gift cards...'
-        self.out(message, level=logging.INFO)
-        with Progress(expand=True) as progress:
+        with self.progress() as progress:
             task = progress.add_task(message, total=len(self.orders))
+            self.out(message, level=logging.INFO)
             for order in self.orders:
                 order_details = self.get_order(order)
                 for payment in order_details.get('payments', []):
@@ -470,7 +507,7 @@ class Connector:
         table.add_column('Tax Amount', no_wrap=True, justify='right')
         table.add_column('Status', no_wrap=True)
 
-        with Progress(expand=True) as progress:
+        with self.progress() as progress:
             message = f'Importing {total_vouchers} invoices...'
             task = progress.add_task(message, total=total_vouchers)
             self.out(message)
