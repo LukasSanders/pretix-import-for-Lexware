@@ -959,6 +959,7 @@ class Connector:
             'taxType': 'gross',
             'useCollectiveContact': True,
             'remark': self.replace_placeholders(self.settings.texts.giftcard, order),
+            '_skip_document_attachment': True,
             'voucherItems': [{
                 'amount': amount,
                 'taxAmount': 0.0,
@@ -1086,9 +1087,14 @@ class Connector:
                     # A HTTP error with status 429 may occur if the API rate limit is exceeded. 
                     # In that case, the script will wait for two seconds and retry for a specified
                     # number of times (given in the settings file).
+                    voucher_payload = voucher.copy()
+                    skip_document_attachment = voucher_payload.pop(
+                        '_skip_document_attachment',
+                        False,
+                    )
                     for attempt in range(self.settings.lexware.retry_count + 1):
                         try:
-                            result = self.create_voucher(voucher)
+                            result = self.create_voucher(voucher_payload)
                         except requests.RequestException as error:
                             status = '[bold red]failed'
                             self.import_failed += 1
@@ -1101,19 +1107,32 @@ class Connector:
                         if result.ok:
                             voucher_id = result.json()['id']
 
-                            try:
-                                self.attach_document(voucher['voucherNumber'], voucher_id)
+                            if skip_document_attachment:
                                 status = '[bold green]successful'
                                 self.import_successful += 1
                                 self.out(
-                                    f'Invoice {voucher["voucherNumber"]} imported successfully. Invoice document attached.'
+                                    f'Invoice {voucher["voucherNumber"]} imported successfully. '
+                                    'No invoice document to attach.'
                                 )
-                            except requests.RequestException:
-                                status = '[yellow]warning'
-                                self.import_successful += 1
-                                self.out(
-                                    f'Invoice {voucher["voucherNumber"]} imported successfully. Invoice document could not be attached.'
-                                )
+                            else:
+                                try:
+                                    self.attach_document(
+                                        voucher['voucherNumber'],
+                                        voucher_id,
+                                    )
+                                    status = '[bold green]successful'
+                                    self.import_successful += 1
+                                    self.out(
+                                        f'Invoice {voucher["voucherNumber"]} imported '
+                                        'successfully. Invoice document attached.'
+                                    )
+                                except requests.RequestException:
+                                    status = '[yellow]warning'
+                                    self.import_successful += 1
+                                    self.out(
+                                        f'Invoice {voucher["voucherNumber"]} imported '
+                                        'successfully. Invoice document could not be attached.'
+                                    )
                             break
                         if result.status_code == 429 and attempt < self.settings.lexware.retry_count:
                             time.sleep(2)
