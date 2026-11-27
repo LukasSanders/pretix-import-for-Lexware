@@ -1099,11 +1099,21 @@ class Connector:
                             )
                             break
                         if result.ok:
-                            status = '[bold green]successful'
-                            self.import_successful += 1
-                            self.out(
-                                f'Invoice {voucher["voucherNumber"]} imported successfully.'
-                            )
+                            voucher_id = result.json()['id']
+
+                            try:
+                                self.attach_document(voucher['voucherNumber'], voucher_id)
+                                status = '[bold green]successful'
+                                self.import_successful += 1
+                                self.out(
+                                    f'Invoice {voucher["voucherNumber"]} imported successfully. Invoice document attached.'
+                                )
+                            except requests.RequestException:
+                                status = '[yellow]warning'
+                                self.import_successful += 1
+                                self.out(
+                                    f'Invoice {voucher["voucherNumber"]} imported successfully. Invoice document could not be attached.'
+                                )
                             break
                         if result.status_code == 429 and attempt < self.settings.lexware.retry_count:
                             time.sleep(2)
@@ -1146,6 +1156,67 @@ class Connector:
             f'successful, {self.import_failed} failed out of {total_vouchers} total.'
         )
 
+    def attach_document(
+        self,
+        voucher_number: str,
+        voucher_id: str,
+    ) -> requests.Response:
+        """Download the invoice PDF and attach it to the Lexware voucher."""
+        pdf_content = self.download_invoice(voucher_number)
+        return self.upload_document(voucher_number, voucher_id, pdf_content)
+
+    def download_invoice(self, voucher_number: str) -> bytes:
+        """Download an invoice PDF from pretix."""
+        download_url = (
+            self.settings.pretix.resource_url
+            + '/invoices/'
+            + voucher_number
+            + '/download'
+        )
+        pretix_headers = {
+            'Authorization': 'Token ' + self.settings.pretix.api_token,
+        }
+        pdf_response = requests.request(
+            'GET',
+            download_url,
+            headers=pretix_headers,
+            timeout=self.settings.request_timeout,
+        )
+        pdf_response.raise_for_status()
+        return pdf_response.content
+
+    def upload_document(
+        self,
+        voucher_number: str,
+        voucher_id: str,
+        pdf_content: bytes,
+    ) -> requests.Response:
+        """Upload an invoice PDF to a Lexware voucher."""
+        upload_url = (
+            self.settings.lexware.api_url
+            + '/vouchers/'
+            + voucher_id
+            + '/files'
+        )
+        lexware_headers = {
+            'Authorization': 'Bearer ' + self.settings.lexware.api_key,
+            'Accept': 'application/json',
+        }
+        upload_response = requests.request(
+            'POST',
+            upload_url,
+            headers=lexware_headers,
+            files={
+                'file': (
+                    f'{voucher_number}.pdf',
+                    pdf_content,
+                    'application/pdf',
+                ),
+            },
+            timeout=self.settings.request_timeout,
+        )
+        upload_response.raise_for_status()
+        return upload_response
 
 def main(): 
     """Parse command-line options and run the invoice import."""
