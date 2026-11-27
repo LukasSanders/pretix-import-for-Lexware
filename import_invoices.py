@@ -1161,12 +1161,50 @@ class Connector:
         voucher_number: str,
         voucher_id: str,
     ) -> requests.Response:
-        """Download the invoice PDF and attach it to the Lexware voucher."""
+        """
+        Download the invoice PDF and attach it to the Lexware voucher.
+
+        Parameters
+        ----------
+        voucher_number : str
+            Lexware voucher number/pretix invoice number. 
+        voucher_id: str
+            Unique ID of the lexware voucher, needed for file upload. 
+
+        Returns
+        -------
+        requests.Response
+            HTTP response returned by the Lexware API.
+
+        Raises
+        ------
+        requests.RequestException
+            If the pretix or Lexware API request fails due to a network or HTTP client error.
+        """
+
         pdf_content = self.download_invoice(voucher_number)
         return self.upload_document(voucher_number, voucher_id, pdf_content)
 
     def download_invoice(self, voucher_number: str) -> bytes:
-        """Download an invoice PDF from pretix."""
+        """
+        Download an invoice PDF from pretix.
+
+        Parameters
+        ----------
+        voucher_number
+            pretix invoice number.
+        
+        Returns
+        -------
+        bytes
+            The downloaded invoice in PDF format. 
+
+        Raises
+        ------
+        requests.RequestException
+            If the pretix or Lexware API request fails due to a network or HTTP client error.            
+        """
+
         download_url = (
             self.settings.pretix.resource_url
             + '/invoices/'
@@ -1191,7 +1229,29 @@ class Connector:
         voucher_id: str,
         pdf_content: bytes,
     ) -> requests.Response:
-        """Upload an invoice PDF to a Lexware voucher."""
+        """
+        Upload a PDF to a Lexware voucher.
+
+        Parameters
+        ----------
+        voucher_number : str
+            Lexware voucher number/pretix invoice number. 
+        voucher_id: str
+            Unique ID of the lexware voucher, needed for file upload. 
+        pdf_content: bytes
+            The pdf to upload. 
+        
+        Returns
+        -------
+        requests.Response
+            HTTP response returned by the Lexware API.
+
+        Raises
+        ------
+        requests.RequestException
+            If the pretix or Lexware API request fails due to a network or HTTP client error.            
+        """
+
         upload_url = (
             self.settings.lexware.api_url
             + '/vouchers/'
