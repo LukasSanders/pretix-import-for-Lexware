@@ -5,7 +5,7 @@
 	symlinks = false
 	ignorecase = true
 [remote "origin"]
-	url = https://github.com/LukasSanders/pretix-api.git
+	url = https://github.com/LukasSanders/pretix-import-for-Lexware.git
 	tagOpt = --no-tags
 	fetch = +refs/*:refs/*
 	mirror = true
