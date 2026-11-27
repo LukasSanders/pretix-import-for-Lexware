@@ -224,3 +224,4 @@ __marimo__/
 
 # Test files and directories
 test/
+test/settings.yaml

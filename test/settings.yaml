@@ -8,7 +8,7 @@ api_settings:
     resource_url: "https://tickets.pony-events.eu/api/v1/organizers/PEF/events/GC27"
     api_token: "wdcw3yb8f1o11tg8ui4j2gqtp8ii5ofxlohir228d51cykgth0pkjfpoq6qvcm2h"
 texts:
-  voucher: "Bestellung %order% zu Veranstaltung GalaCon 2027\n%invoice_to_name%, %invoice_to_street%, %invoice_from_zipcode%, %invoice_to_city%, %invoice_to_country%"
+  voucher: "Bestellung %order% zu Veranstaltung GalaCon 2027\n%invoice_to_name%, %invoice_to_street%, %invoice_to_zipcode%, %invoice_to_city%, %invoice_to_country%"
   cancellation: 'Storno '
   reference: '\nReferenzbelegnummer: %refers%'
   giftcard: "Einlösung Gutschein für Veranstaltung GalaCon 2027\nBestellung %code%"
