@@ -221,3 +221,6 @@ __marimo__/
 
 # VS Code
 .vscode/
+
+# Test files and directories
+test/
