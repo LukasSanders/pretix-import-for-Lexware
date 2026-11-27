@@ -959,6 +959,7 @@ class Connector:
             'taxType': 'gross',
             'useCollectiveContact': True,
             'remark': self.replace_placeholders(self.settings.texts.giftcard, order),
+            '_skip_document_attachment': True,
             'voucherItems': [{
                 'amount': amount,
                 'taxAmount': 0.0,
@@ -1086,9 +1087,14 @@ class Connector:
                     # A HTTP error with status 429 may occur if the API rate limit is exceeded. 
                     # In that case, the script will wait for two seconds and retry for a specified
                     # number of times (given in the settings file).
+                    voucher_payload = voucher.copy()
+                    skip_document_attachment = voucher_payload.pop(
+                        '_skip_document_attachment',
+                        False,
+                    )
                     for attempt in range(self.settings.lexware.retry_count + 1):
                         try:
-                            result = self.create_voucher(voucher)
+                            result = self.create_voucher(voucher_payload)
                         except requests.RequestException as error:
                             status = '[bold red]failed'
                             self.import_failed += 1
@@ -1099,11 +1105,34 @@ class Connector:
                             )
                             break
                         if result.ok:
-                            status = '[bold green]successful'
-                            self.import_successful += 1
-                            self.out(
-                                f'Invoice {voucher["voucherNumber"]} imported successfully.'
-                            )
+                            voucher_id = result.json()['id']
+
+                            if skip_document_attachment:
+                                status = '[bold green]successful'
+                                self.import_successful += 1
+                                self.out(
+                                    f'Invoice {voucher["voucherNumber"]} imported successfully. '
+                                    'No invoice document to attach.'
+                                )
+                            else:
+                                try:
+                                    self.attach_document(
+                                        voucher['voucherNumber'],
+                                        voucher_id,
+                                    )
+                                    status = '[bold green]successful'
+                                    self.import_successful += 1
+                                    self.out(
+                                        f'Invoice {voucher["voucherNumber"]} imported '
+                                        'successfully. Invoice document attached.'
+                                    )
+                                except requests.RequestException:
+                                    status = '[yellow]warning'
+                                    self.import_successful += 1
+                                    self.out(
+                                        f'Invoice {voucher["voucherNumber"]} imported '
+                                        'successfully. Invoice document could not be attached.'
+                                    )
                             break
                         if result.status_code == 429 and attempt < self.settings.lexware.retry_count:
                             time.sleep(2)
@@ -1146,6 +1175,127 @@ class Connector:
             f'successful, {self.import_failed} failed out of {total_vouchers} total.'
         )
 
+    def attach_document(
+        self,
+        voucher_number: str,
+        voucher_id: str,
+    ) -> requests.Response:
+        """
+        Download the invoice PDF and attach it to the Lexware voucher.
+
+        Parameters
+        ----------
+        voucher_number : str
+            Lexware voucher number/pretix invoice number. 
+        voucher_id: str
+            Unique ID of the lexware voucher, needed for file upload. 
+
+        Returns
+        -------
+        requests.Response
+            HTTP response returned by the Lexware API.
+
+        Raises
+        ------
+        requests.RequestException
+            If the pretix or Lexware API request fails due to a network or HTTP client error.
+        """
+
+        pdf_content = self.download_invoice(voucher_number)
+        return self.upload_document(voucher_number, voucher_id, pdf_content)
+
+    def download_invoice(self, voucher_number: str) -> bytes:
+        """
+        Download an invoice PDF from pretix.
+
+        Parameters
+        ----------
+        voucher_number
+            pretix invoice number.
+        
+        Returns
+        -------
+        bytes
+            The downloaded invoice in PDF format. 
+
+        Raises
+        ------
+        requests.RequestException
+            If the pretix or Lexware API request fails due to a network or HTTP client error.            
+        """
+
+        download_url = (
+            self.settings.pretix.resource_url
+            + '/invoices/'
+            + voucher_number
+            + '/download'
+        )
+        pretix_headers = {
+            'Authorization': 'Token ' + self.settings.pretix.api_token,
+        }
+        pdf_response = requests.request(
+            'GET',
+            download_url,
+            headers=pretix_headers,
+            timeout=self.settings.request_timeout,
+        )
+        pdf_response.raise_for_status()
+        return pdf_response.content
+
+    def upload_document(
+        self,
+        voucher_number: str,
+        voucher_id: str,
+        pdf_content: bytes,
+    ) -> requests.Response:
+        """
+        Upload a PDF to a Lexware voucher.
+
+        Parameters
+        ----------
+        voucher_number : str
+            Lexware voucher number/pretix invoice number. 
+        voucher_id: str
+            Unique ID of the lexware voucher, needed for file upload. 
+        pdf_content: bytes
+            The pdf to upload. 
+        
+        Returns
+        -------
+        requests.Response
+            HTTP response returned by the Lexware API.
+
+        Raises
+        ------
+        requests.RequestException
+            If the pretix or Lexware API request fails due to a network or HTTP client error.            
+        """
+
+        upload_url = (
+            self.settings.lexware.api_url
+            + '/vouchers/'
+            + voucher_id
+            + '/files'
+        )
+        lexware_headers = {
+            'Authorization': 'Bearer ' + self.settings.lexware.api_key,
+            'Accept': 'application/json',
+        }
+        upload_response = requests.request(
+            'POST',
+            upload_url,
+            headers=lexware_headers,
+            files={
+                'file': (
+                    f'{voucher_number}.pdf',
+                    pdf_content,
+                    'application/pdf',
+                ),
+            },
+            timeout=self.settings.request_timeout,
+        )
+        upload_response.raise_for_status()
+        return upload_response
 
 def main(): 
     """Parse command-line options and run the invoice import."""
